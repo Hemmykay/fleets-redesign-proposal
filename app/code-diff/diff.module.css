@@ -1,0 +1,191 @@
+/* Scoped VS Code look — tokens live on .panel, not :root, so they never
+   collide with the app's own --bg/--accent/etc. design tokens. Dark (Dark+)
+   by default, Light+ under prefers-color-scheme: light — this embeds inside
+   a page that otherwise follows the app's own light/dark handling. */
+
+.panel {
+  --bg: #1e1e1e; --sidebar: #252526; --activity: #333333; --titlebar: #3c3c3c;
+  --border: #2b2b2b; --border-soft: #383838; --text: #cccccc; --text-dim: #8a8a8a; --text-bright: #ffffff;
+  --accent: #0a84ff; --accent-soft: #37373d; --selected: #37373d; --hover: #2a2d2e;
+  --statusbar: #007acc; --statusbar-text: #ffffff;
+  --m: #e2c08d; --u: #73c991; --tab-active-bg: #1e1e1e; --tab-inactive-bg: #2d2d2d;
+  --diff-del-bg: #4b1818; --diff-del-line: #5a1d1d; --diff-add-bg: #1e3a24; --diff-add-line: #274d2c;
+  --tag-del-fg: #ffb3b3; --tag-add-fg: #b3ffc2;
+  --scrollbar: #4d4d4d;
+  --font-mono: "SF Mono", Consolas, "Cascadia Code", Menlo, monospace;
+  --k: #569cd6; --t: #4ec9b0; --s: #ce9178; --c: #6a9955; --n: #b5cea8; --fn: #dcdcaa; --macro: #c586c0;
+
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  height: 680px;
+  display: flex;
+  flex-direction: column;
+}
+
+@media (prefers-color-scheme: light) {
+  .panel {
+    --bg: #ffffff; --sidebar: #f3f3f3; --activity: #2c2c2c; --titlebar: #dddddd;
+    --border: #e5e5e5; --border-soft: #e0e0e0; --text: #3b3b3b; --text-dim: #767676; --text-bright: #000000;
+    --accent: #0066b8; --accent-soft: #e4e6f1; --selected: #e4e6f1; --hover: #e8e8e8;
+    --statusbar: #0066b8; --statusbar-text: #ffffff;
+    --m: #8f6b1e; --u: #2e7d32; --tab-active-bg: #ffffff; --tab-inactive-bg: #ececec;
+    --diff-del-bg: #ffd9d9; --diff-del-line: #ffbdbd; --diff-add-bg: #c9f0d0; --diff-add-line: #a9e5b4;
+    --tag-del-fg: #7a1d1d; --tag-add-fg: #1d5c28;
+    --scrollbar: #c2c2c2;
+    --k: #0000ff; --t: #267f99; --s: #a31515; --c: #008000; --n: #098658; --fn: #795e26; --macro: #af00db;
+  }
+}
+
+.titlebar {
+  height: 30px; flex: none; background: var(--titlebar); display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); user-select: none; gap: 8px; position: relative;
+}
+.dots { position: absolute; left: 12px; display: flex; gap: 6px; }
+.dot { width: 11px; height: 11px; border-radius: 50%; transition: filter .1s ease, transform .1s ease; }
+.dotR { background: #ff5f57; } .dotY { background: #febc2e; } .dotG { background: #28c840; }
+.dotR[role="button"], .dotG[role="button"] { cursor: pointer; }
+.dotR[role="button"]:hover, .dotG[role="button"]:hover { filter: brightness(1.15); transform: scale(1.08); }
+.dotR[role="button"]:focus-visible, .dotG[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.titlebar b { color: var(--text); font-weight: 600; }
+
+.exitFsBtn {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  background: var(--hover); color: var(--text); border: 1px solid var(--border-soft); border-radius: 4px;
+  font-family: -apple-system, sans-serif; font-size: 11px; padding: 3px 9px; cursor: pointer;
+}
+.exitFsBtn:hover { background: var(--selected); }
+
+.fullscreenPanel {
+  position: fixed; inset: 0; z-index: 1000; height: 100vh; width: 100vw;
+  border-radius: 0; border: none; box-shadow: none;
+}
+
+.body { flex: 1; display: flex; min-height: 0; }
+
+.activity { width: 44px; flex: none; background: var(--activity); display: flex; flex-direction: column; align-items: center; padding-top: 8px; gap: 2px; }
+.activityBtn { width: 44px; height: 44px; background: none; border: none; color: #858585; cursor: pointer; display: flex; align-items: center; justify-content: center; position: relative; padding: 0; }
+.activityBtn.active { color: #ffffff; }
+.activityBtn.active::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 2px; background: #ffffff; }
+.activityBtn svg { width: 20px; height: 20px; }
+.badge {
+  position: absolute; bottom: 4px; right: 4px; background: var(--accent); color: #fff; font-size: 9px; font-weight: 700;
+  border-radius: 8px; min-width: 15px; height: 15px; display: flex; align-items: center; justify-content: center; padding: 0 3px;
+  font-family: -apple-system, sans-serif;
+}
+
+.sidebar { width: 260px; flex: none; background: var(--sidebar); display: flex; flex-direction: column; border-right: 1px solid var(--border); overflow: hidden; }
+.sidebarTitle { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); padding: 9px 14px 6px; font-weight: 600; flex: none; }
+.sidebarScroll { flex: 1; overflow-y: auto; }
+
+.treeFolder { display: flex; align-items: center; gap: 4px; padding: 3px 8px 3px 10px; cursor: pointer; color: var(--text); white-space: nowrap; user-select: none; }
+.treeFolder:hover { background: var(--hover); }
+.treeFolder svg { width: 15px; height: 15px; flex: none; color: var(--text-dim); }
+.indent1 { padding-left: 18px; }
+.indent2 { padding-left: 34px; }
+
+.fileRow { display: flex; align-items: center; gap: 6px; padding: 3px 8px; cursor: pointer; white-space: nowrap; user-select: none; }
+.fileRow:hover { background: var(--hover); }
+.fileRow.active { background: var(--selected); }
+.fileIcon { width: 15px; height: 15px; flex: none; color: #519aba; }
+.fileName { flex: 1; overflow: hidden; text-overflow: ellipsis; color: var(--text); font-size: 12.5px; }
+.fileRow.changed .fileName { color: var(--m); }
+.fileRow.untracked .fileName { color: var(--u); }
+.fileStatus { font-size: 11px; font-weight: 700; width: 16px; text-align: center; flex: none; }
+.fileRow.changed .fileStatus { color: var(--m); }
+.fileRow.untracked .fileStatus { color: var(--u); }
+
+.scGroup { padding: 4px 14px 2px; font-size: 11px; color: var(--text-dim); display: flex; justify-content: space-between; align-items: center; user-select: none; }
+.scNote { padding: 0 14px 10px; font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
+.tabs { flex: none; display: flex; background: var(--tab-inactive-bg); overflow-x: auto; overflow-y: hidden; border-bottom: 1px solid var(--border); }
+.tab {
+  display: flex; align-items: center; gap: 8px; padding: 0 10px 0 12px; height: 32px; font-size: 12.5px; color: var(--text-dim);
+  background: var(--tab-inactive-bg); border-right: 1px solid var(--border); cursor: pointer; white-space: nowrap; flex: none; max-width: 200px;
+}
+.tab.active { background: var(--tab-active-bg); color: var(--text-bright); box-shadow: inset 0 -1px 0 var(--accent); }
+.tab .tabStatus { font-weight: 700; font-size: 11px; }
+.tab.changed .tabStatus { color: var(--m); }
+.tab.untracked .tabStatus { color: var(--u); }
+.tname { overflow: hidden; text-overflow: ellipsis; }
+
+.breadcrumb { flex: none; padding: 5px 14px; font-size: 11.5px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+.breadcrumb b { color: var(--text); font-weight: 400; }
+
+.why {
+  flex: none; max-height: 128px; overflow-y: auto; padding: 9px 14px; background: var(--accent-soft);
+  border-bottom: 1px solid var(--border); font-size: 12px; line-height: 1.55; color: var(--text);
+}
+.why b { color: var(--text-bright); }
+
+.diffWrap { flex: 1; display: flex; min-height: 0; }
+.diffPane { flex: 1; min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+.diffPane:last-child { border-right: none; }
+.paneHead {
+  flex: none; padding: 5px 12px; font-size: 10.5px; color: var(--text-dim); background: var(--sidebar);
+  border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: .05em; display: flex; align-items: center; gap: 6px;
+}
+.paneTag { font-size: 9.5px; padding: 1px 6px; border-radius: 3px; font-weight: 700; letter-spacing: 0; text-transform: none; }
+.paneTagOrig { background: var(--diff-del-line); color: var(--tag-del-fg); }
+.paneTagProp { background: var(--diff-add-line); color: var(--tag-add-fg); }
+.paneCode { flex: 1; overflow: auto; font-size: 12px; line-height: 19px; }
+.paneCode table { border-collapse: collapse; width: 100%; }
+.paneCode tr { height: 19px; }
+.rowDel { background: var(--diff-del-bg); }
+.rowAdd { background: var(--diff-add-bg); }
+.rowEmpty td { background: repeating-linear-gradient(135deg, transparent, transparent 6px, var(--border-soft) 6px, var(--border-soft) 7px); }
+.numCell { width: 40px; min-width: 40px; text-align: right; padding-right: 8px; color: var(--text-dim); user-select: none; vertical-align: top; font-variant-numeric: tabular-nums; }
+.codeCell { padding-left: 8px; white-space: pre; color: var(--text); vertical-align: top; }
+.paneCodeWrap tr { height: auto; }
+.paneCodeWrap .codeCell { white-space: pre-wrap; word-break: break-word; }
+.rowDel .numCell { background: var(--diff-del-line); color: #e0a3a3; }
+.rowAdd .numCell { background: var(--diff-add-line); color: #a3e0b0; }
+
+.rowNoted { cursor: pointer; }
+.rowNoted:hover { filter: brightness(1.18); }
+.rowNoted .numCell::after { content: '\25CF'; font-size: 6px; color: var(--tag-add-fg); margin-left: 4px; vertical-align: middle; }
+.rowNotedOpen { filter: brightness(1.1); }
+.noteRow td { padding: 0; border: none; }
+.noteBox {
+  display: flex; gap: 8px; align-items: flex-start; margin: 2px 8px 6px 40px; padding: 8px 10px;
+  background: var(--sidebar); border: 1px solid var(--diff-add-line); border-left: 3px solid var(--tag-add-fg);
+  border-radius: 5px; font-family: -apple-system, sans-serif; font-size: 12px; line-height: 1.5; color: var(--text);
+  white-space: normal;
+}
+.noteBox b { color: var(--tag-add-fg); font-weight: 700; }
+.noteClose {
+  flex: none; background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 13px;
+  line-height: 1; padding: 2px 4px; margin-left: auto;
+}
+.noteClose:hover { color: var(--text); }
+
+.statusbar { flex: none; height: 21px; background: var(--statusbar); color: var(--statusbar-text); display: flex; align-items: center; padding: 0 10px; font-size: 11.5px; gap: 14px; font-family: -apple-system, sans-serif; }
+.statusItem { display: flex; align-items: center; gap: 5px; }
+.sep { flex: 1; }
+.statusToggle {
+  background: none; border: none; color: var(--statusbar-text); font-family: -apple-system, sans-serif;
+  font-size: 11.5px; cursor: pointer; padding: 0 6px; height: 21px; opacity: .85;
+}
+.statusToggle:hover { opacity: 1; background: rgba(255, 255, 255, 0.12); }
+.statusToggleActive { opacity: 1; background: rgba(255, 255, 255, 0.18); font-weight: 600; }
+.statusToggleActive:hover { background: rgba(255, 255, 255, 0.22); }
+
+.legendSwatch { width: 13px; height: 2px; display: inline-block; border-radius: 1px; }
+
+/* Syntax-highlight token colors — global because diff-utils.ts's highlight()
+   emits these class names inside a raw HTML string (dangerouslySetInnerHTML),
+   which CSS Modules cannot scope/hash. Named distinctively (tok-*) to avoid
+   colliding with any other global class in the app. Colors are still read
+   from .panel's scoped custom properties via inheritance. */
+.panel :global(.tok-k) { color: var(--k); }
+.panel :global(.tok-t) { color: var(--t); }
+.panel :global(.tok-s) { color: var(--s); }
+.panel :global(.tok-c) { color: var(--c); font-style: italic; }
+.panel :global(.tok-n) { color: var(--n); }
+.panel :global(.tok-fn) { color: var(--fn); }
+.panel :global(.tok-macro) { color: var(--macro); }
