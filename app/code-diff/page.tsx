@@ -39,7 +39,7 @@ export default function CodeDiffPage() {
   const [activeIdx, setActiveIdx] = useState(0);
   const [view, setView] = useState<'explorer' | 'scm'>('explorer');
   const [fullscreen, setFullscreen] = useState(false);
-  const [wrap, setWrap] = useState(false);
+  const [wrap, setWrap] = useState(true);
 
   // Green dot = maximize, like the real macOS traffic light. Escape backs
   // out too, and the page itself stops scrolling behind the overlay while

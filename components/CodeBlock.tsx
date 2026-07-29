@@ -7,7 +7,7 @@ import { highlightRust } from '@/lib/highlightRust';
  * past the card's width — off by default (matches how the rest of the app's
  * code blocks behave, horizontal-scroll), on flips to pre-wrap. */
 export default function CodeBlock({ code, fontSize = 12.3 }: { code: string; fontSize?: number }) {
-  const [wrap, setWrap] = useState(false);
+  const [wrap, setWrap] = useState(true);
   return (
     <div className="code-block">
       <button

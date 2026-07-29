@@ -97,7 +97,7 @@ interface ActiveLoan {
 
 export interface SimEvent {
   period: number;
-  kind: 'origination' | 'origination-blocked' | 'default' | 'mint-note' | 'mint' | 'mint-blocked' | 'redeem';
+  kind: 'origination' | 'origination-blocked' | 'default' | 'mint' | 'mint-blocked' | 'redeem';
   detail: string;
 }
 
@@ -387,14 +387,13 @@ export function runSimulation(config: ScenarioConfig): SimResult {
 
     const coveragePct = coverageOf(outstanding, ffc) * 100;
     const severity = severityOf(outstanding, ffc, fyc);
-    const mint = assertMintAllowed({ fyc, ffc, outstanding });
-    if (!mint.allowed) {
-      events.push({
-        period,
-        kind: 'mint-note',
-        detail: `FFC minting blocked this period — severity ${(severity * 100).toFixed(2)}% ≤ ${(mint.threshold * 100).toFixed(0)}% floor`,
-      });
-    }
+    // NOTE: whether minting is currently blocked is a STATE (read directly
+    // off step.severity in the UI, against SEVERITY_MINT_FLOOR), not an
+    // EVENT — it used to fire into the log every single period severity sat
+    // at/below the floor, which clogged the log with an identical line
+    // repeated dozens of times in a row. mint-blocked below still fires as a
+    // real event, but only when an actual mint attempt lands and gets
+    // rejected — that's a thing that happened, not an ambient status.
 
     steps.push({
       period,

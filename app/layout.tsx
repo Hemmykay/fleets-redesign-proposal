@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 import Sidebar from '@/components/Sidebar';
 import { SeverityGateProvider } from '@/components/SeverityGateContext';
+import { SimulatorStateProvider } from '@/components/SimulatorStateContext';
 
 export const metadata: Metadata = {
   title: 'FYC / FFC Yield Distribution — Redesign',
@@ -14,12 +15,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <SeverityGateProvider>
-          <div className="shell">
-            <Sidebar />
-            <main className="main">
-              <div className="main-inner">{children}</div>
-            </main>
-          </div>
+          <SimulatorStateProvider>
+            <div className="shell">
+              <Sidebar />
+              <main className="main">
+                <div className="main-inner">{children}</div>
+              </main>
+            </div>
+          </SimulatorStateProvider>
         </SeverityGateProvider>
       </body>
     </html>

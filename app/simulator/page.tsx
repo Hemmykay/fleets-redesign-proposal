@@ -6,56 +6,60 @@ import LineChart from '@/components/LineChart';
 import { PageHeader, Card, Readout, Pill, Callout, Collapsible } from '@/components/ui';
 import { runSimulation, type OriginationEvent, type DefaultEvent, type TrancheActivityEvent } from '@/lib/simulate';
 import { generateRandomOriginations, generateRandomTrancheActivity } from '@/lib/random';
-import { fmtUSD } from '@/lib/model';
+import { fmtUSD, SEVERITY_MINT_FLOOR } from '@/lib/model';
 import { useSeverityGate } from '@/components/SeverityGateContext';
-
-let idCounter = 1;
-function nextId() {
-  return 'e' + idCounter++;
-}
-
-const DEFAULT_ORIGINATIONS: OriginationEvent[] = [
-  { id: nextId(), period: 1, amount: 450000, apr: 0.08, termMonths: 36 },
-];
-const DEFAULT_DEFAULTS: DefaultEvent[] = [];
-const DEFAULT_ACTIVITY: TrancheActivityEvent[] = [];
+import { useSimulatorState } from '@/components/SimulatorStateContext';
+import { nextId } from '@/lib/idCounter';
 
 export default function SimulatorPage() {
-  const [initialFyc, setInitialFyc] = useState(600000);
-  const [initialFfc, setInitialFfc] = useState(400000);
-  const [reserveApy, setReserveApy] = useState(0.028);
-  const [periods, setPeriods] = useState(36);
-  const [originations, setOriginations] = useState<OriginationEvent[]>(DEFAULT_ORIGINATIONS);
-  const [defaults, setDefaults] = useState<DefaultEvent[]>(DEFAULT_DEFAULTS);
+  // Lifted into SimulatorStateProvider (root layout) so leaving this page to
+  // read another one and coming back doesn't reset the scenario you built —
+  // only the transient view state below (is playback running, which rows
+  // are expanded) stays local, since that's fine to reset on remount.
+  const {
+    initialFyc, setInitialFyc,
+    initialFfc, setInitialFfc,
+    reserveApy, setReserveApy,
+    periods, setPeriods,
+    originations, setOriginations,
+    defaults, setDefaults,
+    randomMode, setRandomMode,
+    randomSeed, setRandomSeed,
+    randomAprMin, setRandomAprMin,
+    randomAprMax, setRandomAprMax,
+    randomAmountMin, setRandomAmountMin,
+    randomAmountMax, setRandomAmountMax,
+    randomFrequency, setRandomFrequency,
+    randomTermMonths, setRandomTermMonths,
+    trancheActivity, setTrancheActivity,
+    randomActivityMode, setRandomActivityMode,
+    randomActivitySeed, setRandomActivitySeed,
+    randomActivityFrequency, setRandomActivityFrequency,
+    randomActivityAmountMin, setRandomActivityAmountMin,
+    randomActivityAmountMax, setRandomActivityAmountMax,
+    randomActivityRedeemFraction, setRandomActivityRedeemFraction,
+    randomActivityFfcFraction, setRandomActivityFfcFraction,
+    cursor, setCursor,
+    playbackSeconds, setPlaybackSeconds,
+  } = useSimulatorState();
+
   // Shared with /explorer's "Severity gate (origination)" slider — set it
   // there, it carries through to this run too.
   const { severityGateMax, setSeverityGateMax } = useSeverityGate();
   const severityGateFraction = severityGateMax / 100;
 
-  const [randomMode, setRandomMode] = useState(false);
-  const [randomSeed, setRandomSeed] = useState(1);
-  const [randomAprMin, setRandomAprMin] = useState(0.15);
-  const [randomAprMax, setRandomAprMax] = useState(0.18);
-  const [randomAmountMin, setRandomAmountMin] = useState(50000);
-  const [randomAmountMax, setRandomAmountMax] = useState(200000);
-  const [randomFrequency, setRandomFrequency] = useState(3);
-  const [randomTermMonths, setRandomTermMonths] = useState(24);
-
-  const [trancheActivity, setTrancheActivity] = useState<TrancheActivityEvent[]>(DEFAULT_ACTIVITY);
-  const [randomActivityMode, setRandomActivityMode] = useState(false);
-  const [randomActivitySeed, setRandomActivitySeed] = useState(1);
-  const [randomActivityFrequency, setRandomActivityFrequency] = useState(4);
-  const [randomActivityAmountMin, setRandomActivityAmountMin] = useState(20000);
-  const [randomActivityAmountMax, setRandomActivityAmountMax] = useState(120000);
-  const [randomActivityRedeemFraction, setRandomActivityRedeemFraction] = useState(0.3);
-  const [randomActivityFfcFraction, setRandomActivityFfcFraction] = useState(0.5);
-
-  const [cursor, setCursor] = useState(0);
   const [expandedMonths, setExpandedMonths] = useState<Set<number>>(new Set());
   const [playing, setPlaying] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const randomOriginations = useMemo(
+  // Random originations are generated in two passes. Pass 1 fills the user's
+  // stated duration; if that alone forces an extension (a loan landing near
+  // the end needs more months to amortize than the stated duration leaves),
+  // pass 2 regenerates against that EXTENDED window, same seed, so
+  // randomization keeps going all the way to the real final duration instead
+  // of stopping cold at the original input. Manual originations don't need
+  // this — they're each pinned to an explicit period already.
+  const randomOriginationsPass1 = useMemo(
     () =>
       generateRandomOriginations({
         seed: randomSeed,
@@ -69,33 +73,52 @@ export default function SimulatorPage() {
       }),
     [randomSeed, periods, randomFrequency, randomAprMin, randomAprMax, randomAmountMin, randomAmountMax, randomTermMonths],
   );
-  const effectiveOriginations = randomMode ? randomOriginations : originations;
+  const effectiveOriginationsPass1 = randomMode ? randomOriginationsPass1 : originations;
+  const durationPass1 = effectiveOriginationsPass1.reduce((max, o) => Math.max(max, o.period + o.termMonths), periods);
 
+  const randomOriginationsFinal = useMemo(
+    () =>
+      randomMode
+        ? generateRandomOriginations({
+            seed: randomSeed,
+            periods: durationPass1,
+            frequency: randomFrequency,
+            aprMin: randomAprMin,
+            aprMax: randomAprMax,
+            amountMin: randomAmountMin,
+            amountMax: randomAmountMax,
+            termMonths: randomTermMonths,
+          })
+        : randomOriginationsPass1,
+    [randomMode, randomSeed, durationPass1, randomFrequency, randomAprMin, randomAprMax, randomAmountMin, randomAmountMax, randomTermMonths, randomOriginationsPass1],
+  );
+  const effectiveOriginations = randomMode ? randomOriginationsFinal : originations;
+
+  // Always run long enough for the last loan to fully amortize to $0 — a loan
+  // originated late with a long term must not get cut off mid-schedule just
+  // because "simulation duration" was set shorter.
+  const effectivePeriods = effectiveOriginations.reduce(
+    (max, o) => Math.max(max, o.period + o.termMonths),
+    durationPass1,
+  );
+
+  // Tranche activity (mint/redeem) never extends the run itself — a deposit
+  // or withdrawal is instantaneous, not a multi-period commitment — so this
+  // only ever needs the ONE final duration, no two-pass dance.
   const randomTrancheActivity = useMemo(
     () =>
       generateRandomTrancheActivity({
         seed: randomActivitySeed,
-        periods,
+        periods: effectivePeriods,
         frequency: randomActivityFrequency,
         amountMin: randomActivityAmountMin,
         amountMax: randomActivityAmountMax,
         redeemFraction: randomActivityRedeemFraction,
         ffcFraction: randomActivityFfcFraction,
       }),
-    [randomActivitySeed, periods, randomActivityFrequency, randomActivityAmountMin, randomActivityAmountMax, randomActivityRedeemFraction, randomActivityFfcFraction],
+    [randomActivitySeed, effectivePeriods, randomActivityFrequency, randomActivityAmountMin, randomActivityAmountMax, randomActivityRedeemFraction, randomActivityFfcFraction],
   );
   const effectiveTrancheActivity = randomActivityMode ? randomTrancheActivity : trancheActivity;
-
-  // Always run long enough for the last loan to fully amortize to $0 — a loan
-  // originated late with a long term must not get cut off mid-schedule just
-  // because "periods to simulate" was set shorter. New originations are still
-  // only ever scheduled within the user's stated window (see `periods` above,
-  // which bounds generateRandomOriginations); only the run LENGTH extends.
-  const lastLoanCompletion = effectiveOriginations.reduce(
-    (max, o) => Math.max(max, o.period + o.termMonths),
-    periods,
-  );
-  const effectivePeriods = Math.max(periods, lastLoanCompletion);
 
   const result = useMemo(
     () =>
@@ -118,6 +141,7 @@ export default function SimulatorPage() {
 
   useEffect(() => {
     if (playing) {
+      const intervalMs = Math.max(16, (playbackSeconds * 1000) / Math.max(1, effectivePeriods));
       timerRef.current = setInterval(() => {
         setCursor((c) => {
           if (c >= effectivePeriods) {
@@ -126,12 +150,12 @@ export default function SimulatorPage() {
           }
           return c + 1;
         });
-      }, 260);
+      }, intervalMs);
     }
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [playing, effectivePeriods]);
+  }, [playing, effectivePeriods, playbackSeconds]);
 
   const step = result.steps[cursor] ?? result.steps[result.steps.length - 1];
   const eventsAtCursor = result.events.filter((e) => e.period === cursor);
@@ -166,7 +190,7 @@ export default function SimulatorPage() {
           <NumberField label="Initial FYC (senior)" value={initialFyc} onChange={setInitialFyc} step={10000} prefix="$" />
           <NumberField label="Initial FFC (junior)" value={initialFfc} onChange={setInitialFfc} step={10000} prefix="$" />
           <NumberField label="Reserve/USDY APY (true rate)" value={reserveApy * 100} onChange={(v) => setReserveApy(v / 100)} step={0.1} suffix="%" />
-          <NumberField label="Periods to simulate (minimum)" value={periods} onChange={(v) => setPeriods(Math.max(1, Math.min(120, Math.round(v))))} step={1} />
+          <NumberField label="Simulation duration (periods)" value={periods} onChange={(v) => setPeriods(Math.max(1, Math.min(240, Math.round(v))))} step={1} />
           <NumberField
             label="Severity gate (origination)"
             value={severityGateMax}
@@ -176,8 +200,10 @@ export default function SimulatorPage() {
           />
         </div>
         <p className="section-dek" style={{ fontSize: 11.5, marginTop: 10, marginBottom: 0 }}>
-          Also the window new originations can land in. The run itself always goes at least this long, and
-          automatically longer if needed — see below. The severity gate is shared with{' '}
+          How long the whole run plays out — also the window new originations and mint/redeem activity can land
+          in, and randomization of either now fills this entire window, not just an initial slice of it. The
+          run still automatically extends past this if a loan originated near the end needs more months to
+          amortize to $0 — see below. The severity gate is shared with{' '}
           <Link href="/explorer">Coverage &amp; curve</Link> — changing it here changes it there too.
         </p>
       </Card>
@@ -229,12 +255,12 @@ export default function SimulatorPage() {
                 🎲 reroll (seed {randomSeed})
               </button>
               <p className="section-dek" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
-                {randomOriginations.length} loan{randomOriginations.length === 1 ? '' : 's'} generated, APR{' '}
+                {randomOriginationsFinal.length} loan{randomOriginationsFinal.length === 1 ? '' : 's'} generated, APR{' '}
                 {(randomAprMin * 100).toFixed(1)}%–{(randomAprMax * 100).toFixed(1)}%. Deterministic per seed — scrubbing
                 the playhead won&rsquo;t reshuffle it, only &ldquo;reroll&rdquo; will.
               </p>
               <div style={{ maxHeight: 140, overflowY: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--text-secondary)' }}>
-                {randomOriginations.map((o) => (
+                {randomOriginationsFinal.map((o) => (
                   <div key={o.id} style={{ display: 'flex', gap: 10, padding: '3px 0' }}>
                     <span style={{ color: 'var(--text-muted)', minWidth: 40 }}>p{o.period}</span>
                     <span>{fmtUSD(o.amount)}</span>
@@ -341,7 +367,28 @@ export default function SimulatorPage() {
       <Card style={{ marginTop: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6, flexWrap: 'wrap', gap: 8 }}>
           <h3 style={{ margin: 0 }}>Playback — period {cursor} of {effectivePeriods}</h3>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>
+              play over
+              <input
+                type="number"
+                min={1}
+                step={1}
+                value={playbackSeconds}
+                onChange={(e) => setPlaybackSeconds(Math.max(1, +e.target.value))}
+                style={{
+                  width: 52,
+                  padding: '4px 6px',
+                  borderRadius: 5,
+                  border: '1px solid var(--border-strong)',
+                  background: 'var(--surface-2)',
+                  color: 'var(--text-primary)',
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 12,
+                }}
+              />
+              sec
+            </label>
             <button
               className="pill good"
               style={{ cursor: 'pointer', border: 'none' }}
@@ -357,6 +404,10 @@ export default function SimulatorPage() {
             </button>
           </div>
         </div>
+        <p className="section-dek" style={{ fontSize: 11, marginTop: 0, marginBottom: 10 }}>
+          &ldquo;Play&rdquo; advances one period roughly every {(playbackSeconds * 1000 / Math.max(1, effectivePeriods)).toFixed(0)}ms, so
+          the whole {effectivePeriods}-period run finishes in about {playbackSeconds}s.
+        </p>
         {effectivePeriods > periods && (
           <p className="section-dek" style={{ fontSize: 11.5, color: 'var(--warning)', marginTop: 0, marginBottom: 10 }}>
             Extended from {periods} to {effectivePeriods} periods — the last loan (originated period{' '}
@@ -395,6 +446,9 @@ export default function SimulatorPage() {
 
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
           {step.defaultLoss > 0 && <Pill tone="bad">default this period: {fmtUSD(step.defaultLoss)}</Pill>}
+          {step.severity <= SEVERITY_MINT_FLOOR && (
+            <Pill tone="neutral">FFC mint floor active — severity {(step.severity * 100).toFixed(2)}% ≤ {(SEVERITY_MINT_FLOOR * 100).toFixed(0)}%</Pill>
+          )}
           {eventsAtCursor.map((e, i) => (
             <Pill
               key={i}
@@ -519,7 +573,7 @@ export default function SimulatorPage() {
               const open = expandedMonths.has(p);
               const hasFlag = monthEvents.some((e) => e.kind === 'origination-blocked' || e.kind === 'mint-blocked' || e.kind === 'default');
               return (
-                <div key={p} style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+                <div key={p} style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden', flexShrink: 0 }}>
                   <button
                     type="button"
                     onClick={() =>
