@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 import 'katex/dist/katex.min.css';
 import Sidebar from '@/components/Sidebar';
+import PageTransition from '@/components/PageTransition';
 import { SeverityGateProvider } from '@/components/SeverityGateContext';
 import { SimulatorStateProvider } from '@/components/SimulatorStateContext';
 
@@ -13,14 +14,14 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" data-scroll-behavior="smooth">
       <body>
         <SeverityGateProvider>
           <SimulatorStateProvider>
             <div className="shell">
               <Sidebar />
               <main className="main">
-                <div className="main-inner">{children}</div>
+                <PageTransition>{children}</PageTransition>
               </main>
             </div>
           </SimulatorStateProvider>

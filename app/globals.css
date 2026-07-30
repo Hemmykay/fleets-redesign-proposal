@@ -62,6 +62,11 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
 body {
   background: var(--bg);
   color: var(--text-primary);
@@ -72,6 +77,18 @@ body {
 }
 ::selection { background: var(--accent-wash); }
 a { color: var(--accent); }
+a:focus-visible, button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px;
+}
+
+/* Cross-page navigation fade — every route's content eases in instead of
+   popping, so moving between pages (or landing from a /latex cross-link)
+   reads as one continuous app, not a stack of disconnected documents. */
+@keyframes page-fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.main-inner { animation: page-fade-in .28s cubic-bezier(.22,.9,.3,1); }
+
+@keyframes collapsible-open { from { opacity: 0; } to { opacity: 1; } }
+.collapsible[open] > .collapsible-body { animation: collapsible-open .18s ease; }
 
 /* ---------- Shell layout ---------- */
 .shell { display: flex; min-height: 100vh; }
@@ -94,9 +111,11 @@ a { color: var(--accent); }
 .sidebar-link {
   display: flex; align-items: baseline; gap: 8px; padding: 8px 10px; border-radius: 7px;
   font-size: 13.5px; color: var(--text-secondary); text-decoration: none;
+  transition: background-color .12s ease, color .12s ease;
 }
 .sidebar-link:hover { background: var(--surface-2); color: var(--text-primary); }
 .sidebar-link.active { background: var(--accent-wash); color: var(--text-primary); font-weight: 600; }
+.sidebar-link:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 .sidebar-link .num { font-family: var(--font-mono); font-size: 11px; color: var(--ffc); min-width: 16px; }
 .sidebar-foot { padding: 14px 20px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
 .main { flex: 1; min-width: 0; }
@@ -308,6 +327,36 @@ input.ffc-slide { --accent-c: var(--ffc); }
 .latex-inline .katex { font-size: 1.02em; }
 .katex { color: var(--text-primary); }
 
+/* ---------- cross-links (glossary / code-diff / try-it) — /latex ---------- */
+.latex-links { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px; }
+.latex-link {
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 100px;
+  font-size: 12px; font-family: var(--font-mono); font-weight: 600; text-decoration: none;
+  background: var(--surface-2); color: var(--text-secondary); border: 1px solid var(--border);
+  transition: background-color .15s ease, color .15s ease, border-color .15s ease, transform .1s ease;
+}
+.latex-link:hover { background: var(--surface-3); color: var(--text-primary); border-color: var(--border-strong); transform: translateY(-1px); }
+.latex-link:active { transform: translateY(0); }
+.latex-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.latex-link-accent { background: var(--accent-wash); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.latex-link-accent:hover { background: color-mix(in srgb, var(--accent) 22%, var(--accent-wash)); color: var(--accent); }
+
+/* ---------- editable worked-example inputs — /latex ---------- */
+.worked-inputs { display: flex; flex-wrap: wrap; gap: 14px 18px; }
+.worked-input { display: flex; flex-direction: column; gap: 5px; min-width: 108px; }
+.worked-input-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); font-family: var(--font-mono); }
+.worked-input-field {
+  display: flex; align-items: center; gap: 4px; padding: 6px 10px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--surface); transition: border-color .15s ease, box-shadow .15s ease;
+}
+.worked-input-field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
+.worked-input-affix { font-size: 12.5px; color: var(--text-muted); font-family: var(--font-mono); white-space: nowrap; }
+.worked-input-field input {
+  width: 100%; min-width: 0; border: none; background: transparent; outline: none; padding: 0;
+  font-family: var(--font-mono); font-size: 13px; color: var(--text-primary); font-variant-numeric: tabular-nums;
+}
+.worked-input-field input::-webkit-inner-spin-button { opacity: .5; }
+
 .code-block { position: relative; }
 .wrap-toggle {
   position: absolute; top: 10px; right: 10px; z-index: 1;
@@ -336,8 +385,9 @@ table.impl code { font-family: var(--font-mono); font-size: 12.5px; color: var(-
 .oq-list p b { color: var(--text-primary); }
 
 /* ---------- glossary ---------- */
-.gloss-entry { border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; background: var(--surface); box-shadow: var(--shadow); }
+.gloss-entry { border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; background: var(--surface); box-shadow: var(--shadow); scroll-margin-top: 24px; transition: background-color .3s ease, border-color .3s ease; }
 .gloss-entry + .gloss-entry { margin-top: 14px; }
+.gloss-entry.gloss-highlight { background: var(--accent-wash); border-color: var(--accent); }
 .gloss-term { font-family: var(--font-display); font-size: 19px; font-weight: 500; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
 .gloss-symbol { font-family: var(--font-mono); font-size: 13px; color: var(--text-muted); font-weight: 400; }
 .gloss-def { font-size: 14px; color: var(--text-secondary); margin: 8px 0 12px; }

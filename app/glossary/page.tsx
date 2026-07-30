@@ -1,4 +1,8 @@
+'use client';
+
+import { useEffect } from 'react';
 import { PageHeader } from '@/components/ui';
+import { slugify } from '@/lib/slug';
 import {
   coverageOf,
   severityOf,
@@ -49,7 +53,7 @@ interface Entry {
 
 function Entry({ e }: { e: Entry }) {
   return (
-    <div className="gloss-entry">
+    <div className="gloss-entry" id={slugify(e.term)}>
       <div className="gloss-term">
         {e.term}
         {e.symbol && <span className="gloss-symbol">{e.symbol}</span>}
@@ -270,9 +274,9 @@ const entries: { group: string; items: Entry[] }[] = [
         def: 'Capital reserved out of ELB the moment a loan reaches the off-chain "equity received" pipeline stage — before it actually originates on-chain — so it can’t be instantly redeemed out from under a loan that’s already committed. Released either when the loan originates (moves into outstanding_principal) or is cancelled; carries an expiry so a forgotten cancellation can’t permanently over-reserve capital.',
       },
       {
-        term: 'Yield source',
-        symbol: 'YieldSourceState (multi-source)',
-        def: 'Extends the single registered reserve token into a full registry — admin-gated to initialize (assert_admin, same as set_redemption_fees) and admin-gated to disable. A disabled source stops receiving new deposits and is prioritized for unwinding on the next redemption that needs to swap yield-token → stable.',
+        term: 'Multi-source registry',
+        symbol: 'many YieldSourceState PDAs',
+        def: 'Extends the single registered reserve token (see "Yield source" above) into a full registry — admin-gated to initialize (assert_admin, same as set_redemption_fees) and admin-gated to disable. A disabled source stops receiving new deposits and is prioritized for unwinding on the next redemption that needs to swap yield-token → stable.',
       },
       {
         term: 'Per-source observed APY',
@@ -296,6 +300,30 @@ const entries: { group: string; items: Entry[] }[] = [
 ];
 
 export default function GlossaryPage() {
+  // Deep-linked from /latex and /code-diff ("View in glossary"). Scrolls to
+  // the target entry and flashes a highlight so landing here from another
+  // page is never "where did it go" — works on first load AND on same-page
+  // hash changes (clicking a second glossary link while already here).
+  useEffect(() => {
+    let cleanupTimeout: (() => void) | undefined;
+    const jumpToHash = () => {
+      const hash = window.location.hash.slice(1);
+      if (!hash) return;
+      const el = document.getElementById(hash);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('gloss-highlight');
+      const t = setTimeout(() => el.classList.remove('gloss-highlight'), 2200);
+      cleanupTimeout = () => clearTimeout(t);
+    };
+    jumpToHash();
+    window.addEventListener('hashchange', jumpToHash);
+    return () => {
+      window.removeEventListener('hashchange', jumpToHash);
+      cleanupTimeout?.();
+    };
+  }, []);
+
   return (
     <>
       <PageHeader

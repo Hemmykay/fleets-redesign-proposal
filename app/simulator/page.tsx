@@ -1,7 +1,8 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { useSearchParams } from 'next/navigation';
 import LineChart from '@/components/LineChart';
 import { PageHeader, Card, Readout, Pill, Callout, Collapsible } from '@/components/ui';
 import { runSimulation, type OriginationEvent, type DefaultEvent, type TrancheActivityEvent } from '@/lib/simulate';
@@ -12,6 +13,15 @@ import { useSimulatorState } from '@/components/SimulatorStateContext';
 import { nextId } from '@/lib/idCounter';
 
 export default function SimulatorPage() {
+  return (
+    <Suspense fallback={null}>
+      <SimulatorPageInner />
+    </Suspense>
+  );
+}
+
+function SimulatorPageInner() {
+  const searchParams = useSearchParams();
   // Lifted into SimulatorStateProvider (root layout) so leaving this page to
   // read another one and coming back doesn't reset the scenario you built —
   // only the transient view state below (is playback running, which rows
@@ -47,6 +57,39 @@ export default function SimulatorPage() {
   // there, it carries through to this run too.
   const { severityGateMax, setSeverityGateMax } = useSeverityGate();
   const severityGateFraction = severityGateMax / 100;
+
+  // Deep-linked from /latex's "Try in simulator" buttons — a worked example
+  // isn't just a static number here, it's the exact same scenario, actually
+  // run. Applied once per navigation (tracked by a stringified key, not a
+  // boolean) so visiting a SECOND preset link later still takes effect,
+  // without this effect re-firing on every unrelated re-render or fighting
+  // the visitor's own edits afterward.
+  const appliedPreset = useRef<string | null>(null);
+  useEffect(() => {
+    const key = searchParams.toString();
+    if (!key || key === appliedPreset.current) return;
+    const redeemAmount = searchParams.get('redeemAmount');
+    if (!searchParams.get('fyc') && !redeemAmount) return; // not a preset link
+    appliedPreset.current = key;
+
+    if (searchParams.get('fyc')) setInitialFyc(Number(searchParams.get('fyc')));
+    if (searchParams.get('ffc')) setInitialFfc(Number(searchParams.get('ffc')));
+    if (searchParams.get('apy')) setReserveApy(Number(searchParams.get('apy')) / 100);
+    if (searchParams.get('periods')) setPeriods(Number(searchParams.get('periods')));
+    setRandomMode(false);
+    setRandomActivityMode(false);
+
+    if (redeemAmount) {
+      const tranche = (searchParams.get('redeemTranche') as 'fyc' | 'ffc') ?? 'ffc';
+      const mode = (searchParams.get('redeemMode') as 'instant' | 'scheduled') ?? 'instant';
+      const period = Number(searchParams.get('redeemPeriod') ?? '1');
+      setTrancheActivity([{ id: nextId(), period, tranche, kind: 'redeem', amount: Number(redeemAmount), mode }]);
+      setCursor(Number(searchParams.get('cursor') ?? period));
+    } else {
+      setCursor(Number(searchParams.get('cursor') ?? '0'));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   const [expandedMonths, setExpandedMonths] = useState<Set<number>>(new Set());
   const [playing, setPlaying] = useState(false);

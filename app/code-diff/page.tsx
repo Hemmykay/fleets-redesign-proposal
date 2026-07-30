@@ -1,6 +1,7 @@
 'use client';
 
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { PageHeader } from '@/components/ui';
 import { FILES, type DiffFile } from './files-data';
 import { diffLines, extractLineNotes, highlight } from './diff-utils';
@@ -40,6 +41,15 @@ function statusClass(s: 'M' | 'U') {
 }
 
 export default function CodeDiffPage() {
+  return (
+    <Suspense fallback={null}>
+      <CodeDiffInner />
+    </Suspense>
+  );
+}
+
+function CodeDiffInner() {
+  const searchParams = useSearchParams();
   const [activeIdx, setActiveIdx] = useState(0);
   const [view, setView] = useState<'explorer' | 'scm'>('explorer');
   const [fullscreen, setFullscreen] = useState(false);
@@ -57,6 +67,30 @@ export default function CodeDiffPage() {
       }
       return next;
     });
+  }
+
+  // Deep-linked from /latex and /redemption/etc's "View in code" buttons —
+  // ?file=<path> jumps straight to that file, turning its category on if it
+  // was toggled off, instead of leaving the visitor to hunt through 35 files
+  // for the one the formula they just read actually lives in. Adjusted
+  // during render (same pattern as the activeCategories fallback below) —
+  // guarded with STATE, not a ref, since refs can't be read/written during
+  // render; the guard converges after one extra render and the visitor is
+  // free to click around afterward without this fighting them.
+  const [appliedFileParam, setAppliedFileParam] = useState<string | null>(null);
+  {
+    const file = searchParams.get('file');
+    if (file && file !== appliedFileParam) {
+      setAppliedFileParam(file);
+      const idx = FILES.findIndex((f) => f.path === file);
+      if (idx >= 0) {
+        setActiveIdx(idx);
+        setView('explorer');
+        if (!activeCategories.has(FILES[idx].category)) {
+          setActiveCategories(new Set(activeCategories).add(FILES[idx].category));
+        }
+      }
+    }
   }
 
   // Resizable/collapsible CURRENT|PROPOSED split. leftWidthPct only applies
