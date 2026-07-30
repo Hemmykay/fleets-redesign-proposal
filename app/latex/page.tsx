@@ -19,12 +19,19 @@ import {
   convertTranche,
   instantRedemptionFeeSplit,
   blendedApy,
+  blendedLoanApy,
+  protocolBlendedApy,
   pickRebalanceTarget,
   NET_YIELD_FRACTION,
   ALLOCATION_CEILING_FRACTION,
   SEVERITY_REF,
   COVERAGE_WEIGHT_FLOOR,
   PERIODS_PER_YEAR,
+  SECONDS_PER_DAY,
+  SECONDS_PER_PERIOD,
+  ZERO_LOAN_ACCRUAL,
+  rollupLoanAccrual,
+  addLoanToAccrual,
   fmtUSD,
   fmtUSD2,
   fmtPct,
@@ -558,6 +565,135 @@ const ROUND_2: Eq[] = [
           { id: 'b', capitalUsd: v.cap2, apy: v.apy2 / 100, enabled: true },
         ];
         return [{ label: 'Blended APY', value: fmtPct(blendedApy(sources), 2), color: 'var(--good)' }];
+      },
+    },
+  },
+  {
+    label: 'Optimistic price (used to mint)',
+    tex: '\\text{price}_{\\text{opt}} = \\frac{V_{\\text{tranche}} + \\text{yield\\_estimate} + \\text{loan\\_estimate}}{\\text{total\\_supply}}',
+    note: 'Deliberately assumes yield that has genuinely accrued but hasn’t been formally collected yet is already in the tranche’s value — so a same-period depositor can’t buy in cheap right before a sweep and dilute existing holders. loan_estimate is the Reward-per-second accrual below; yield_estimate is the reserve token’s own unrealized price appreciation since its last epoch tick.',
+    glossaryTerm: 'Optimistic price',
+    codeFile: 'pinochio/src/helpers/allocation.rs',
+    worked: {
+      inputs: [
+        { key: 'vTranche', label: 'V_tranche', value: 600000, step: 10000, prefix: '$' },
+        { key: 'yieldEstimate', label: 'Yield estimate', value: 2100, step: 100, prefix: '$' },
+        { key: 'loanEstimate', label: 'Loan estimate', value: 3400, step: 100, prefix: '$' },
+        { key: 'supply', label: 'Total supply', value: 600000, step: 10000, suffix: 'tokens' },
+      ],
+      compute: (v) => {
+        const price = (v.vTranche + v.yieldEstimate + v.loanEstimate) / v.supply;
+        return [{ label: 'Optimistic (mint) price', value: `$${price.toFixed(4)}`, color: 'var(--good)' }];
+      },
+    },
+  },
+  {
+    label: 'Conservative price (used to redeem)',
+    tex: '\\text{price}_{\\text{cons}} = \\frac{V_{\\text{tranche}}}{\\text{total\\_supply}}',
+    note: 'Counts only value that has actually been collected and recorded in v_tranche — none of the optimistic assumptions above. Minting high and redeeming low, never the reverse, is what keeps the two prices from ever letting someone extract yield that was only ever assumed, not real.',
+    glossaryTerm: 'Conservative price',
+    codeFile: 'pinochio/src/helpers/waterfall.rs',
+    worked: {
+      inputs: [
+        { key: 'vTranche', label: 'V_tranche', value: 600000, step: 10000, prefix: '$' },
+        { key: 'supply', label: 'Total supply', value: 600000, step: 10000, suffix: 'tokens' },
+      ],
+      compute: (v) => {
+        const price = v.vTranche / v.supply;
+        return [{ label: 'Conservative (redeem) price', value: `$${price.toFixed(4)}`, color: 'var(--good)' }];
+      },
+    },
+  },
+  {
+    label: 'Reward-per-second loan accrual',
+    tex: '\\text{rollup}(\\text{now}) = \\text{checkpoint} + \\text{rate} \\times (\\text{now} - \\text{updated\\_at})',
+    note: 'Feeds loan_estimate above, correctly regardless of how staggered individual loans’ origination dates are — a pool-wide rate (Σ every accruing loan’s own levelized_interest ÷ its period length) plus a checkpoint, both re-banked on every loan lifecycle event (originate/repay/flag-default) BEFORE the rate changes. That ordering is what makes it exact: a loan contributes zero to anything banked before it existed, and a just-collected payment is subtracted back out so it can never double-count on the next rollup. Try it below — loan B originating well after loan A must not retroactively change loan A’s own share.',
+    glossaryTerm: 'Reward-per-second accrual',
+    codeFile: 'pinochio/src/helpers/allocation.rs',
+    worked: {
+      inputs: [
+        { key: 'principalA', label: 'Loan A principal', value: 100000, step: 10000, prefix: '$' },
+        { key: 'aprA', label: 'Loan A APR', value: 15, step: 0.5, suffix: '%' },
+        { key: 'termA', label: 'Loan A term', value: 36, step: 1, suffix: 'periods' },
+        { key: 'originDayA', label: 'Loan A origin day ("July 3" = day 0)', value: 0, step: 1, suffix: 'day' },
+        { key: 'principalB', label: 'Loan B principal', value: 60000, step: 10000, prefix: '$' },
+        { key: 'aprB', label: 'Loan B APR', value: 18, step: 0.5, suffix: '%' },
+        { key: 'termB', label: 'Loan B term', value: 24, step: 1, suffix: 'periods' },
+        { key: 'originDayB', label: 'Loan B origin day ("July 21")', value: 18, step: 1, suffix: 'day' },
+        { key: 'queryDay', label: 'Query day', value: 25, step: 1, suffix: 'day' },
+      ],
+      compute: (v) => {
+        const levA = levelizedInterest(v.principalA, v.aprA / 100, v.termA);
+        const levB = levelizedInterest(v.principalB, v.aprB / 100, v.termB);
+        const originA = v.originDayA * SECONDS_PER_DAY;
+        const originB = v.originDayB * SECONDS_PER_DAY;
+        const queryTs = v.queryDay * SECONDS_PER_DAY;
+
+        let state = ZERO_LOAN_ACCRUAL;
+        const originations = [
+          { ts: originA, lev: levA },
+          { ts: originB, lev: levB },
+        ]
+          .filter((o) => o.ts <= queryTs)
+          .sort((a, b) => a.ts - b.ts);
+        for (const o of originations) state = addLoanToAccrual(state, o.ts, o.lev);
+
+        const accum = rollupLoanAccrual(state, queryTs);
+        const rateA = levA / SECONDS_PER_PERIOD;
+        const rateB = levB / SECONDS_PER_PERIOD;
+        const truth = rateA * Math.max(0, queryTs - originA) + rateB * Math.max(0, queryTs - originB);
+        const matches = Math.abs(accum - truth) < 0.01;
+
+        return [
+          { label: 'Accumulator result', value: fmtUSD2(accum), color: 'var(--good)' },
+          { label: 'Ground truth (independent per-loan sum)', value: fmtUSD2(truth) },
+          { label: 'Match?', value: matches ? 'Yes — exact, no leak or invention' : 'MISMATCH', color: matches ? 'var(--good)' : 'var(--critical)' },
+        ];
+      },
+    },
+  },
+  {
+    label: 'Blended loan-book APY',
+    tex: '\\overline{\\text{APR}}_{\\text{loans}} = \\frac{\\sum_{i} \\text{balance}_i \\times \\text{apr}_i}{\\sum_{i} \\text{balance}_i}',
+    note: 'The loan book’s own AVERAGE STATED RATE, balance-weighted — a portfolio-composition figure, not a yield-collection one. Differs from the pool’s realized rate once the severity-scaled premium curve is in play; use this for "what does this book of loans average out to by their own terms," the realized-rate readout on /simulator for "what is FYC/FFC actually collecting."',
+    glossaryTerm: 'Blended loan-book APY',
+    worked: {
+      inputs: [
+        { key: 'bal1', label: 'Loan A balance', value: 300000, step: 10000, prefix: '$' },
+        { key: 'apr1', label: 'Loan A APR', value: 15, step: 0.5, suffix: '%' },
+        { key: 'bal2', label: 'Loan B balance', value: 150000, step: 10000, prefix: '$' },
+        { key: 'apr2', label: 'Loan B APR', value: 18, step: 0.5, suffix: '%' },
+      ],
+      compute: (v) => {
+        const loans = [
+          { balance: v.bal1, apr: v.apr1 / 100 },
+          { balance: v.bal2, apr: v.apr2 / 100 },
+        ];
+        return [{ label: 'Blended loan APY', value: fmtPct(blendedLoanApy(loans), 2), color: 'var(--good)' }];
+      },
+    },
+  },
+  {
+    label: 'Protocol blended APY (loans + reserve)',
+    tex: '\\overline{\\text{APY}}_{\\text{protocol}} = \\frac{\\text{Capital}_{\\text{loans}} \\times \\overline{\\text{APY}}_{\\text{loans}} + \\text{Capital}_{\\text{reserve}} \\times \\overline{\\text{APY}}_{\\text{reserve}}}{\\text{Capital}_{\\text{loans}} + \\text{Capital}_{\\text{reserve}}}',
+    note: 'One level up from the two blends above: capital-weighted across BOTH yield streams the pool has — loan interest and reserve/yield-token appreciation — weighted by outstanding loans vs. idle/deployed reserve. Deliberately generic about which loan/reserve APY feeds it: the realized per-period rate answers "what is the protocol collectively earning right now," the two blends above answer "what does this portfolio’s composition average out to."',
+    glossaryTerm: 'Protocol blended APY',
+    tool: { label: '▶ See it live on /simulator', href: '/simulator' },
+    worked: {
+      inputs: [
+        { key: 'loanCapital', label: 'Loan capital', value: 450000, step: 10000, prefix: '$' },
+        { key: 'loanApyPct', label: 'Loan APY', value: 16, step: 0.5, suffix: '%' },
+        { key: 'reserveCapital', label: 'Reserve capital', value: 550000, step: 10000, prefix: '$' },
+        { key: 'reserveApyPct', label: 'Reserve APY', value: 3.73, step: 0.1, suffix: '%' },
+      ],
+      compute: (v) => {
+        const blend = protocolBlendedApy({
+          loanCapital: v.loanCapital,
+          loanApy: v.loanApyPct / 100,
+          reserveCapital: v.reserveCapital,
+          reserveApy: v.reserveApyPct / 100,
+        });
+        return [{ label: 'Protocol blended APY', value: fmtPct(blend, 2), color: 'var(--good)' }];
       },
     },
   },

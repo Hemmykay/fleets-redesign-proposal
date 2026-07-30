@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useState, type ReactNode, type Dispatch, type SetStateAction } from 'react';
 import type { OriginationEvent, DefaultEvent, TrancheActivityEvent } from '@/lib/simulate';
+import { ORIGINATION_FEE_FRACTION } from '@/lib/model';
 import { nextId } from '@/lib/idCounter';
 
 /**
@@ -13,7 +14,7 @@ import { nextId } from '@/lib/idCounter';
  */
 
 const DEFAULT_ORIGINATIONS: OriginationEvent[] = [
-  { id: nextId(), period: 1, amount: 450000, apr: 0.15, termMonths: 36 },
+  { id: nextId(), period: 1, amount: 450000, apr: 0.15, termMonths: 36, feePct: ORIGINATION_FEE_FRACTION },
 ];
 const DEFAULT_DEFAULTS: DefaultEvent[] = [];
 const DEFAULT_ACTIVITY: TrancheActivityEvent[] = [];
@@ -48,6 +49,25 @@ interface SimulatorStateValue {
   setRandomFrequency: (v: number) => void;
   randomTermMonths: number;
   setRandomTermMonths: (v: number) => void;
+  randomFeePctMin: number;
+  setRandomFeePctMin: (v: number) => void;
+  randomFeePctMax: number;
+  setRandomFeePctMax: (v: number) => void;
+  /** When on, originations are sized to push the book's severity up toward
+   * (never past) the severity gate instead of blind [amountMin, amountMax]
+   * sampling — see generateRandomOriginations's severityTarget option. */
+  randomPushSeverity: boolean;
+  setRandomPushSeverity: (v: boolean) => void;
+
+  randomDefaultMode: boolean;
+  setRandomDefaultMode: (v: boolean) => void;
+  randomDefaultSeed: number;
+  setRandomDefaultSeed: Dispatch<SetStateAction<number>>;
+  /** Blended ANNUAL default rate (fraction/year) — the one knob this
+   * generator works with, applied against the generated loan book's
+   * estimated outstanding balance — see generateRandomDefaults. */
+  randomDefaultAnnualRate: number;
+  setRandomDefaultAnnualRate: (v: number) => void;
 
   trancheActivity: TrancheActivityEvent[];
   setTrancheActivity: Dispatch<SetStateAction<TrancheActivityEvent[]>>;
@@ -90,6 +110,13 @@ export function SimulatorStateProvider({ children }: { children: ReactNode }) {
   const [randomAmountMax, setRandomAmountMax] = useState(200000);
   const [randomFrequency, setRandomFrequency] = useState(3);
   const [randomTermMonths, setRandomTermMonths] = useState(24);
+  const [randomFeePctMin, setRandomFeePctMin] = useState(0.005);
+  const [randomFeePctMax, setRandomFeePctMax] = useState(0.02);
+  const [randomPushSeverity, setRandomPushSeverity] = useState(false);
+
+  const [randomDefaultMode, setRandomDefaultMode] = useState(false);
+  const [randomDefaultSeed, setRandomDefaultSeed] = useState(1);
+  const [randomDefaultAnnualRate, setRandomDefaultAnnualRate] = useState(0.02);
 
   const [trancheActivity, setTrancheActivity] = useState<TrancheActivityEvent[]>(DEFAULT_ACTIVITY);
   const [randomActivityMode, setRandomActivityMode] = useState(false);
@@ -120,6 +147,12 @@ export function SimulatorStateProvider({ children }: { children: ReactNode }) {
         randomAmountMax, setRandomAmountMax,
         randomFrequency, setRandomFrequency,
         randomTermMonths, setRandomTermMonths,
+        randomFeePctMin, setRandomFeePctMin,
+        randomFeePctMax, setRandomFeePctMax,
+        randomPushSeverity, setRandomPushSeverity,
+        randomDefaultMode, setRandomDefaultMode,
+        randomDefaultSeed, setRandomDefaultSeed,
+        randomDefaultAnnualRate, setRandomDefaultAnnualRate,
         trancheActivity, setTrancheActivity,
         randomActivityMode, setRandomActivityMode,
         randomActivitySeed, setRandomActivitySeed,

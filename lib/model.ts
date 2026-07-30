@@ -49,8 +49,49 @@ export const SECONDS_PER_YEAR = 365 * SECONDS_PER_DAY;
  * nobody had made consistently yet. */
 export const PERIODS_PER_YEAR = SECONDS_PER_YEAR / SECONDS_PER_PERIOD;
 
+/** The real contract ticks yield-bearing reserve/loan-interest accrual once
+ * every 24 HOURS, not once every SECONDS_PER_PERIOD (30 days) — a much
+ * finer-grained epoch than the loan repayment cycle. `/simulator` samples
+ * yield at 30-day (period) granularity for tractability, one price/interest
+ * observation per loan-repayment cycle instead of 30 — a deliberate scope
+ * simplification, not a bug: because observed_source_apy_bps always
+ * annualizes off a real ACT/365 day-count regardless of how often it's
+ * sampled, the ANNUALIZED rate this produces is essentially unaffected by
+ * tick frequency. Compounding daily vs. once per 30-day period at a 3.5%
+ * true rate over one full year: 3.5618% vs. 3.5568% effective — a
+ * ~0.50 bps absolute difference, negligible next to anything this tool
+ * models (severity swings, default losses, fee splits). Where the daily
+ * cadence DOES matter is anything that reads state mid-period on-chain
+ * (an instant redemption's optimistic price, a loan originating on day 17
+ * of a 30-day cycle) — those read whatever the most recent daily epoch
+ * left behind, not a value frozen at the start of the loan's own period.
+ * The simulator's period-stepped design can't represent that sub-period
+ * state at all; see /open-questions. */
+export const YIELD_EPOCH_SECONDS = SECONDS_PER_DAY;
+
 /** Fee taken off gross yield before any tranche split. 15% fee / 85% net. */
 export const NET_YIELD_FRACTION = 0.85;
+
+/** The 15% yield fee (skimmed off BOTH loan interest and reserve/yield-token
+ * yield) settles as newly-minted FYC, split 2:1 protocol:insurance —
+ * PROTOCOL_FEE_SHARE_NUMERATOR/DENOMINATOR in the real contract. This is a
+ * DIFFERENT fee stream from the round-2 redemption fee (which splits 50/50
+ * — see instantRedemptionFeeSplit): same destination (FYC, both wallets),
+ * different ratio, different source. Not a typo that they differ. */
+export const PROTOCOL_FEE_SHARE_NUMERATOR = 2;
+export const PROTOCOL_FEE_SHARE_DENOMINATOR = 3;
+
+export interface YieldFeeSplit {
+  protocolValueUsd: number;
+  insuranceValueUsd: number;
+}
+
+/** split_fee_value — the 2:1 protocol:insurance split of one period's total
+ * yield fee (loan + reserve combined). */
+export function splitYieldFee(feeValue: number): YieldFeeSplit {
+  const protocolValueUsd = (feeValue * PROTOCOL_FEE_SHARE_NUMERATOR) / PROTOCOL_FEE_SHARE_DENOMINATOR;
+  return { protocolValueUsd, insuranceValueUsd: feeValue - protocolValueUsd };
+}
 
 /** LOAN_ALLOCATION_BPS — max fraction of total pool value deployable as loans. */
 export const ALLOCATION_CEILING_FRACTION = 0.8;
@@ -477,6 +518,119 @@ export function buildOldModelSchedule(
 }
 
 // ---------------------------------------------------------------------------
+// Per-loan interest accrual — a pool-wide reward-per-second accumulator that
+// feeds optimistic pricing's loan-interest estimate, correct regardless of
+// how staggered individual loans' origination dates are. See
+// /glossary#reward-per-second-accrual and the worked example on /latex.
+// ---------------------------------------------------------------------------
+
+/** rate: $/second, the sum of every currently-accruing loan's own
+ * levelizedInterest ÷ its own period length. checkpoint: $ already rolled
+ * up (accrued but not yet collected) as of updatedAt (unix seconds). This
+ * mirrors PoolState's loan_accrual_rate/loan_accrual_checkpoint/
+ * loan_accrual_updated_ts 1:1 — see pinochio/src/state.rs on /code-diff. */
+export interface LoanAccrualState {
+  rate: number;
+  checkpoint: number;
+  updatedAt: number;
+}
+
+export const ZERO_LOAN_ACCRUAL: LoanAccrualState = { rate: 0, checkpoint: 0, updatedAt: 0 };
+
+/** "rate × time since last update" — reading the accumulator at any moment
+ * without mutating it. This is the quantity compute_optimistic_price
+ * actually reads for its loan-interest estimate. */
+export function rollupLoanAccrual(state: LoanAccrualState, nowTs: number): number {
+  const elapsed = Math.max(0, nowTs - state.updatedAt);
+  return state.checkpoint + state.rate * elapsed;
+}
+
+/** A loan originates: bank whatever had already accrued (at the OLD rate,
+ * up to nowTs) into checkpoint, THEN add the new loan's own rate
+ * contribution — in that order. Banking first is what makes staggered
+ * origination dates correct: a loan that doesn't exist yet contributes
+ * nothing to the accrual banked before its own origination instant. */
+export function addLoanToAccrual(
+  state: LoanAccrualState,
+  nowTs: number,
+  loanLevelizedInterest: number,
+  periodSeconds: number = SECONDS_PER_PERIOD,
+): LoanAccrualState {
+  return {
+    checkpoint: rollupLoanAccrual(state, nowTs),
+    rate: state.rate + loanLevelizedInterest / periodSeconds,
+    updatedAt: nowTs,
+  };
+}
+
+/** A loan makes a payment: bank whatever accrued since the last update (at
+ * the OLD rate), THEN subtract the interest this payment just collected —
+ * it's realized now (folded into v_tranche for real by
+ * distribute_loan_interest), not still-accruing, so it must leave the
+ * "accrued but uncollected" checkpoint or every future rollup would
+ * double-count it forever. If this was the loan's LAST payment, its rate
+ * contribution is removed from the pool entirely (mirrors repay_loan.rs
+ * exactly — including subtracting AFTER rolling up, and clamping at 0 the
+ * same way `saturating_sub` does, so a rounding-driven negative checkpoint
+ * can never happen). */
+export function collectLoanAccrual(
+  state: LoanAccrualState,
+  nowTs: number,
+  interestJustCollected: number,
+  opts: { isLastPayment: boolean; loanLevelizedInterest: number; periodSeconds?: number },
+): LoanAccrualState {
+  const rolledUp = rollupLoanAccrual(state, nowTs);
+  const rate = opts.isLastPayment
+    ? Math.max(0, state.rate - opts.loanLevelizedInterest / (opts.periodSeconds ?? SECONDS_PER_PERIOD))
+    : state.rate;
+  return {
+    checkpoint: Math.max(0, rolledUp - interestJustCollected),
+    rate,
+    updatedAt: nowTs,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Origination fee — a one-time payment the BORROWER pays, in addition to
+// their own equity contribution, sized as a fraction of the loan capital
+// being deployed to them. Critically, this money never enters the pool at
+// all: it's not deducted from what the pool disburses (outstanding still
+// grows by the full loan amount, v_fyc/v_ffc untouched, nothing minted) and
+// it's not shared with FYC/FFC holders — it's routed straight to the
+// protocol/insurance wallets as external revenue, the same way a real
+// origination fee works in traditional lending (paid by the borrower,
+// pocketed by the lender's ops, never touching the fund's own NAV).
+// ---------------------------------------------------------------------------
+
+/** 1% default — adjustable per loan; the simulator's randomizer draws each
+ * generated loan's own fee from a configurable [min, max] range (default
+ * 0.5%–2%) the same way it already does for APR. */
+export const ORIGINATION_FEE_FRACTION = 0.01;
+
+/** The $ amount charged — a plain fraction of loan capital, nothing more
+ * than compute_monthly_payment's own `amount` parameter times a rate, but
+ * named so every worked example and call site reads the same as the
+ * formula, not a bare multiply. */
+export function originationFeeValue(loanAmount: number, feeFraction: number): number {
+  return loanAmount * feeFraction;
+}
+
+export interface OriginationFeeSplit {
+  protocolValueUsd: number;
+  insuranceValueUsd: number;
+}
+
+/** 100% protocol, 0% insurance — unlike the redemption fee (50/50) and
+ * yield fee (2:1), the origination fee doesn't cover redemption/insurance
+ * risk at all, so none of it goes to the insurance wallet. Still returns
+ * the same {protocolValueUsd, insuranceValueUsd} shape as the other two
+ * splits so every call site and readout can treat all three fee streams
+ * uniformly. */
+export function splitOriginationFee(feeValue: number): OriginationFeeSplit {
+  return { protocolValueUsd: feeValue, insuranceValueUsd: 0 };
+}
+
+// ---------------------------------------------------------------------------
 // Redemption liquidity — ELB (idle/undeployed reserve) and its tranche split.
 // Second design round — see /redemption, /tranche-swap, /yield-sources.
 // ---------------------------------------------------------------------------
@@ -724,6 +878,82 @@ export function pickRebalanceTarget(sources: YieldSource[], depositAmount: numbe
   }
   const highest = scored.reduce((a, b) => (a.resultingApy >= b.resultingApy ? a : b));
   return { sourceId: highest.id, resultingApy: highest.resultingApy, inRange: false };
+}
+
+// ---------------------------------------------------------------------------
+// Blended APY — loan book, and the protocol as a whole.
+// ---------------------------------------------------------------------------
+
+export interface LoanApyInput {
+  /** Current outstanding balance — a repaid-down or defaulted loan
+   * contributes nothing to the blend, matching how blendedApy above only
+   * weights by capital actually still deployed. */
+  balance: number;
+  /** This loan's own stated APR (fraction, e.g. 0.15 for 15%) — the rate it
+   * was originated at, not the pool's realized collection rate. */
+  apr: number;
+}
+
+/**
+ * Blended loan-book APY — balance-weighted average APR across every active
+ * loan. Same shape as blendedApy above (capital-weighted mean), applied to
+ * the loan side instead of the reserve side:
+ *
+ * ```txt
+ *                   Σ (balance_i × apr_i)
+ * blended_loan_apy = ----------------------
+ *                        Σ balance_i
+ * ```
+ *
+ * This is the loan book's own AVERAGE STATED RATE, not the pool's realized
+ * collection rate — those differ once the severity-scaled premium curve is
+ * in play (distributeLoanInterest splits collected interest between FYC/FFC
+ * at a k-multiplier that isn't 1:1 with any individual loan's own APR). For
+ * "what is FYC/FFC actually earning on the loan book right now," use the
+ * realized rate (gross loan interest this period × PERIODS_PER_YEAR ÷
+ * outstanding — see /simulator's "Loan book APY — blended" readout, or
+ * protocolBlendedApy below when combining it with reserve yield). Use
+ * blendedLoanApy for "what does this book of loans, by their own stated
+ * terms, average out to" — a portfolio-composition question, not a
+ * yield-collection one.
+ */
+export function blendedLoanApy(loans: LoanApyInput[]): number {
+  const total = loans.reduce((s, l) => s + l.balance, 0);
+  if (total <= 0) return 0;
+  return loans.reduce((s, l) => s + l.balance * l.apr, 0) / total;
+}
+
+/**
+ * Protocol-level blended APY — capital-weighted average of the two yield
+ * streams the pool actually has: loan interest and reserve/yield-token
+ * appreciation. Same capital-weighted-mean shape as blendedApy and
+ * blendedLoanApy above, one level up the hierarchy:
+ *
+ * ```txt
+ *                        loan_capital × loan_apy + reserve_capital × reserve_apy
+ * protocol_blended_apy = --------------------------------------------------------
+ *                                       loan_capital + reserve_capital
+ * ```
+ *
+ * Deliberately generic about WHICH loan/reserve APY figure feeds it — pass
+ * the realized per-period rate (gross yield this period, annualized) for
+ * "what is the protocol collectively earning right now," or blendedLoanApy
+ * / blendedApy's stated-rate figures for "what does this portfolio's
+ * composition average out to by its own terms." The two loan-side numbers
+ * usually differ (see blendedLoanApy above); this function doesn't presume
+ * which one you mean.
+ */
+export interface ProtocolBlendedApyInput {
+  loanCapital: number;
+  loanApy: number;
+  reserveCapital: number;
+  reserveApy: number;
+}
+
+export function protocolBlendedApy(input: ProtocolBlendedApyInput): number {
+  const total = input.loanCapital + input.reserveCapital;
+  if (total <= 0) return 0;
+  return (input.loanCapital * input.loanApy + input.reserveCapital * input.reserveApy) / total;
 }
 
 // ---------------------------------------------------------------------------

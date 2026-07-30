@@ -17,7 +17,16 @@ import {
   instantRedemptionFeeBps,
   convertTranche,
   blendedApy,
+  blendedLoanApy,
+  protocolBlendedApy,
   YIELD_TARGET,
+  YIELD_EPOCH_SECONDS,
+  SECONDS_PER_DAY,
+  SECONDS_PER_PERIOD,
+  ZERO_LOAN_ACCRUAL,
+  rollupLoanAccrual,
+  addLoanToAccrual,
+  ORIGINATION_FEE_FRACTION,
   fmtPct,
   PERIODS_PER_YEAR,
 } from '@/lib/model';
@@ -42,6 +51,30 @@ const exampleBlend = blendedApy([
   { id: 'usdy', capitalUsd: 600000, apy: 0.042, enabled: true },
   { id: 'syrupUSDC', capitalUsd: 300000, apy: 0.028, enabled: true },
 ]);
+const exampleLoanBlend = blendedLoanApy([
+  { balance: 300000, apr: 0.15 },
+  { balance: 150000, apr: 0.18 },
+]);
+const exampleProtocolBlend = protocolBlendedApy({
+  loanCapital: OUT,
+  loanApy: exampleLoanBlend,
+  reserveCapital: FYC + FFC - OUT,
+  reserveApy: exampleBlend,
+});
+
+// Staggered-origination accrual worked example — loan A originates "July 3"
+// (day 0), loan B originates 18 days later, "July 21". Proves the O(1)
+// accumulator matches summing each loan's own elapsed-time-into-its-own-
+// cycle accrual, computed independently — see /latex and verify.ts.
+const accrualLoanA = { levelized: levelizedInterest(100000, 0.15, 36), originDay: 0 };
+const accrualLoanB = { levelized: levelizedInterest(60000, 0.18, 24), originDay: 18 };
+const accrualRateA = accrualLoanA.levelized / SECONDS_PER_PERIOD;
+const accrualRateB = accrualLoanB.levelized / SECONDS_PER_PERIOD;
+let accrualState = addLoanToAccrual(ZERO_LOAN_ACCRUAL, accrualLoanA.originDay * SECONDS_PER_DAY, accrualLoanA.levelized);
+accrualState = addLoanToAccrual(accrualState, accrualLoanB.originDay * SECONDS_PER_DAY, accrualLoanB.levelized);
+const accrualQueryDay = 25;
+const accrualAtQuery = rollupLoanAccrual(accrualState, accrualQueryDay * SECONDS_PER_DAY);
+const accrualGroundTruth = accrualRateA * (accrualQueryDay - accrualLoanA.originDay) * SECONDS_PER_DAY + accrualRateB * (accrualQueryDay - accrualLoanB.originDay) * SECONDS_PER_DAY;
 
 interface Entry {
   term: string;
@@ -175,7 +208,18 @@ const entries: { group: string; items: Entry[] }[] = [
       },
       {
         term: 'Reward-per-second accrual',
-        def: 'How the optimistic price estimates loan interest without iterating every loan on-chain. The pool tracks one running rate — the sum of every currently-accruing loan’s own levelized_interest ÷ its period length — plus a checkpoint, both kept current the instant a loan originates, repays, or is flagged pending-default. Reading "rate × time since last update" at any moment gives the same answer as summing every individual loan’s own elapsed-time-into-period, the actual per-loan accrual the design calls for, at O(1) cost instead of iterating the whole loan book.',
+        def: 'How the optimistic price estimates loan interest without iterating every loan on-chain — and, critically, correctly regardless of how staggered individual loans’ origination dates are (a loan originated July 3 and one originated July 21 don’t share a repayment clock). The pool tracks one running rate — the sum of every currently-accruing loan’s own levelized_interest ÷ its period length — plus a checkpoint, both kept current the instant a loan originates, repays, or is flagged pending-default: every update rolls the checkpoint up to now AT THE OLD RATE first, then changes the rate — so a loan contributes zero to anything banked before it existed, and a just-collected payment is subtracted back out (never left to double-count on the next rollup). This event-driven mechanism is NOT tied to the 24-hour yield epoch below — see Yield epoch — it updates on loan lifecycle events, continuously, whenever a query needs it, whichever comes first.',
+        formula: <>{'rollup(state, now) = state.checkpoint + state.rate × (now − state.updatedAt)'}</>,
+        example: (
+          <>
+            Loan A ($100K/15%/36 periods, originates day 0) + Loan B ($60K/18%/24 periods, originates day 18):
+            querying the accumulator on day 25 gives <b>{fmtUSD2(accrualAtQuery)}</b> accrued — exactly matching{' '}
+            <b>{fmtUSD2(accrualGroundTruth)}</b> from independently summing each loan’s own elapsed-time-into-its-own-cycle
+            accrual (25 days of loan A + 7 days of loan B). No value leaked, none invented — see the full multi-step proof
+            (including a repayment crossing a period boundary) in verify.ts, and the interactive version on{' '}
+            <a href="/latex">/latex</a>.
+          </>
+        ),
       },
       {
         term: 'Yield source',
@@ -224,6 +268,18 @@ const entries: { group: string; items: Entry[] }[] = [
         def: 'The protocol’s own, separate internal figure: instead of recognizing the true declining interest each period, it recognizes one flat number every period, computed once at origination from the loan’s total lifetime interest. This is what feeds the yield curve, and what current_balance/outstanding_principal now pay down against too — not just the yield split.',
         formula: <>{'levelized_interest = (M × term_months − principal) / term_months'}</>,
         example: <>Same $100K/15%/36mo loan: total interest over its life ÷ 36 = <b>{fmtUSD2(levInt)}</b>/period, flat.</>,
+      },
+      {
+        term: 'Origination fee',
+        def: 'A one-time fee the BORROWER pays at origination, on top of their own equity contribution — sized as a fraction of the loan capital being deployed to them (1% by default here; the real system today defaults to 30 bps, admin-configurable per contract up to 500 bps — see /open-questions for the gap between that live default and this round’s proposed 1%). Paid alongside the equity deposit, both handled off-chain in the borrower/admin backend, outside the pinocchio program entirely — confirmed against the real repo’s loanApplications flow (requestedEquity + originationFeeBps, "total_due_to_borrower" = both combined). Unlike every other fee in this design, it never touches v_fyc/v_ffc or mints anything: it’s new money from outside the pool, routed straight to the protocol wallet — 100%, insurance gets none of it.',
+        formula: <>{'origination_fee = loan_amount × fee_pct   (paid by borrower, 100% → protocol wallet)'}</>,
+        example: (
+          <>
+            A $100,000 loan at the 1% default: origination fee = <b>{fmtUSD2(100000 * ORIGINATION_FEE_FRACTION)}</b>,
+            paid by the borrower alongside their equity deposit, landing entirely in the protocol wallet — FYC, FFC,
+            and total supply are all completely unaffected.
+          </>
+        ),
       },
       {
         term: 'Net yield / gross yield',
@@ -294,6 +350,28 @@ const entries: { group: string; items: Entry[] }[] = [
         term: 'Target yield range',
         def: 'New capital routes to whichever enabled source moves the blended APY closest to the target, among candidates landing inside [min, max]. The floor exists purely so "couldn’t reach it" is never an error; the ceiling is soft — overshooting is fine, and routing reaches for the highest available APY if nothing lands in range at all.',
         example: <>[min, target, max] = [{fmtPct(YIELD_TARGET.min, 0)}, {fmtPct(YIELD_TARGET.target, 1)}, {fmtPct(YIELD_TARGET.max, 0)}].</>,
+      },
+      {
+        term: 'Yield epoch',
+        def: `The RESERVE side (run_yield_epoch) ticks its price observation once every 24 hours — far finer-grained than the ${'30-day'} loan repayment cycle, and a fixed, periodic cadence. The LOAN side is NOT epoch-ticked at all — see Reward-per-second accrual above, an event-driven, continuous accumulator with no periodic tick of its own; two different mechanisms for two different reasons (a reserve token's price only actually moves when its oracle updates, but loan interest accrues every instant regardless of when anyone looks). /simulator samples yield once per 30-day period for both, a deliberate scope simplification: because every APY figure here annualizes off a real ACT/365 day-count regardless of how often it's sampled, the annualized RATE barely moves (about 0.5 bps difference at 3.5% over a year) — what the coarser sampling can't represent is anything that reads mid-period on-chain state, like a loan originating on day 17 of a cycle. See /open-questions.`,
+        example: <>{`YIELD_EPOCH_SECONDS = ${YIELD_EPOCH_SECONDS.toLocaleString()} (${YIELD_EPOCH_SECONDS / SECONDS_PER_DAY} day), vs. SECONDS_PER_PERIOD's 30 days.`}</>,
+      },
+      {
+        term: 'Blended loan-book APY',
+        def: 'The balance-weighted average of every active loan’s OWN stated APR — a portfolio-composition figure, not a yield-collection one. Distinct from the pool’s realized collection rate (see /simulator’s "Loan book APY — blended" readout), which runs the same interest through the severity-scaled premium curve first; the two only coincide when every loan shares one APR and the curve multiplier is exactly 1×.',
+        formula: <>{'blended_loan_apy = Σ(balance_i × apr_i) / Σ balance_i'}</>,
+        example: <>$300K loan @ 15% + $150K loan @ 18%: blended = <b>{fmtPct(exampleLoanBlend, 2)}</b>.</>,
+      },
+      {
+        term: 'Protocol blended APY',
+        def: 'One level up from Blended portfolio APY and Blended loan-book APY: the capital-weighted average of the loan book’s realized rate and the reserve’s blended rate, weighted by how much capital sits in each — outstanding loans vs. idle/deployed reserve. "What is the protocol, as a whole, earning right now," across both yield streams at once.',
+        formula: <>{'protocol_blended_apy = (loan_capital × loan_apy + reserve_capital × reserve_apy) / (loan_capital + reserve_capital)'}</>,
+        example: (
+          <>
+            {fmtUSD(OUT)} loans @ {fmtPct(exampleLoanBlend, 2)} + {fmtUSD(FYC + FFC - OUT)} reserve @{' '}
+            {fmtPct(exampleBlend, 2)}: blended = <b>{fmtPct(exampleProtocolBlend, 2)}</b>.
+          </>
+        ),
       },
     ],
   },

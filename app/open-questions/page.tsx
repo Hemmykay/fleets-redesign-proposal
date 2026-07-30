@@ -192,6 +192,98 @@ export default function OpenQuestionsPage() {
             the convention this whole redesign already committed to for yield, and because it means a stated
             APR is the APR actually charged, with no asterisk.
           </Q>
+          <Q>
+            <b>The yield fee (15% of gross reserve + loan yield) previously computed a value but never actually
+            minted it — found while auditing the simulator, not a change this round introduced deliberately.</b>{' '}
+            Gross yield came in, the 85% net share landed in <code>v_fyc</code>/<code>v_ffc</code> as documented,
+            but the 15% fee value was calculated and then discarded — silently leaking value out of the model
+            every single period instead of minting new FYC and crediting protocol/insurance, exactly as{' '}
+            <a href="/glossary">/glossary</a> has always described. Fixed in <code>lib/simulate.ts</code>: the
+            fee is now minted into FYC at the price the instant before that period&rsquo;s net yield landed
+            (price-neutral by construction), split 2:1 protocol:insurance via the new{' '}
+            <code>splitYieldFee</code>. Surfaced on <a href="/simulator">/simulator</a> as its own
+            &ldquo;protocol revenue — yield fee&rdquo; readout, separate from the existing redemption-fee
+            revenue, since the two are funded by different things (yield generation vs. redeeming users).
+          </Q>
+          <Q>
+            <b>Optimistic (mint) vs. conservative (redeem) pricing wasn&rsquo;t modeled in the simulator at
+            all until this round</b> — every mint and redeem read the same single <code>v_tranche/supply</code>{' '}
+            price, letting a same-period depositor buy in before a yield sweep and immediately share in yield
+            they contributed nothing to. Fixed by computing a pre-activity yield ESTIMATE each period (off that
+            period&rsquo;s already-active loans and current reserve — the same state steps 3/4 use moments
+            later to actually collect it) and pricing mints against <code>v_tranche + estimate</code> while
+            every redemption path keeps pricing against <code>v_tranche</code> alone. One honest residual gap:
+            the estimate is computed off PRE-activity pool weights, but the actual split three steps later uses
+            POST-activity weights, so a same-period mint or redeem large enough to meaningfully shift the
+            FYC/FFC ratio can end that period&rsquo;s conservative price slightly above what was quoted at mint
+            time (observed up to ~0.02% in testing, scaling with activity size relative to pool). This is a
+            simulator-only artifact of batching a whole period&rsquo;s activity and yield into one step — the
+            real contract has no such batching, since <code>compute_optimistic_price</code> reads live state at
+            the exact instant of the instruction. Not fixed, because fixing it would require pricing a mint off
+            state that includes the mint itself, which is circular; flagged here rather than silently rounded
+            away.
+          </Q>
+          <Q>
+            <b>The real contract&rsquo;s yield-bearing epoch ticks every 24 hours, not every 30 days</b> — a
+            much finer-grained cadence than <code>SECONDS_PER_PERIOD</code>, the loan repayment cycle.{' '}
+            <code>/simulator</code> samples yield once per 30-day period instead of once per day, for the same
+            tractability reason the multi-source rewrite was scope-cut above. This is safe for the numbers this
+            tool reports: every APY figure here annualizes off a real ACT/365 day-count regardless of how often
+            it&rsquo;s sampled, so daily vs. 30-day compounding of the same 3.5% true rate over a year comes out
+            to 3.5618% vs. 3.5568% effective — about half a basis point apart, negligible next to anything else
+            this model varies. What the coarser sampling genuinely can&rsquo;t represent: any mid-period,
+            on-chain state read — a loan originating on day 17 of a 30-day cycle sees whatever the most recent
+            daily epoch left behind, not a value frozen at the cycle&rsquo;s start, and the simulator&rsquo;s
+            period-stepped design has no sub-period state to read at all. See{' '}
+            <code>YIELD_EPOCH_SECONDS</code> in <code>lib/model.ts</code> and <a href="/glossary">/glossary</a>.
+          </Q>
+          <Q>
+            <b>Loans don&rsquo;t all originate on the same calendar day — the real contract handles this
+            correctly, proven, not just asserted.</b> One loan originates July 3, another July 21; both still run
+            their own independent 30-day repayment clock from their own start. <code>compute_optimistic_price</code>{' '}
+            needs &ldquo;how much has each active loan accrued so far&rdquo; at ANY query instant, for ANY mix of
+            staggered origination dates, without iterating the loan book on every call. The pool-wide reward-per-
+            second accumulator (<code>loan_accrual_rate</code>/<code>loan_accrual_checkpoint</code>/
+            <code>loan_accrual_updated_ts</code> — see <a href="/glossary">Reward-per-second accrual</a> and the
+            interactive worked example on <a href="/latex">/latex</a>) gets this exactly right: every lifecycle
+            event (originate, repay, flag-default) rolls the checkpoint up to now AT THE OLD RATE first, then
+            changes the rate — so a loan contributes nothing to anything banked before it existed, and a
+            just-collected payment is subtracted back out so it can never double-count on a later rollup. Verified
+            numerically (not just argued) in <code>verify.ts</code>: a two-loan, staggered-origination scenario
+            crossing a repayment boundary, cross-checked against an independently-computed ground truth at every
+            step — see task 35 in this design tool&rsquo;s own working notes.
+            <br />
+            <br />
+            <code>/simulator</code>, by contrast, doesn&rsquo;t need this mechanism at all — not because it solved
+            the same problem differently, but because it never has the problem in the first place: every loan
+            origination, mint, and redeem in a scenario is tagged with an integer PERIOD (not a calendar date), so
+            two loans &ldquo;originated in the same period&rdquo; are, within the simulator&rsquo;s own model,
+            exactly synchronized by construction — there is no sub-period offset to misrepresent. That&rsquo;s a
+            genuinely coarser abstraction than the real contract&rsquo;s continuous-time accrual, not a bug: it
+            matches the resolution the simulator already commits to everywhere else (see the yield-epoch entry
+            above), and the conservation checks in <code>verify.ts</code> already confirm no value leaks or gets
+            invented at that resolution. A future enhancement — giving the simulator its own per-loan calendar-day
+            origination and running the exact same accumulator functions from <code>lib/model.ts</code> to drive
+            optimistic pricing — is possible but was not undertaken here, for the same tractability reason the
+            multi-source rewrite above was scope-cut: a disproportionate rebuild of the simulator&rsquo;s time-
+            stepping for a refinement the period-level conservation proofs already show doesn&rsquo;t change any
+            reported total.
+          </Q>
+          <Q>
+            <b>The proposed 1% origination fee is a deliberate change from today&rsquo;s live default, not a
+            correction of it.</b> Confirmed against the real repo (<code>backend/*/src/services/repository.ts</code>,{' '}
+            <code>backend/*/.env.example</code>): the live system already charges a per-loan, admin-configurable
+            origination fee — <code>DEFAULT_ORIGINATION_FEE_BPS=30</code> (0.30%) today, overridable per contract up
+            to a schema-enforced 500 bps (5%) ceiling (<code>page.new_contract.ts</code>). It&rsquo;s handled
+            entirely off-chain, alongside the borrower&rsquo;s equity deposit (
+            <code>requestedEquity + originationFeeBps → total_due_to_borrower</code>) — never touching the
+            pinocchio program, confirmed by there being zero matches for <code>origination_fee</code> anywhere in{' '}
+            <code>pinochio/</code>. This round proposes 1% as this design tool&rsquo;s own default (randomizer range
+            0.5%–2% on <code>/simulator</code>), a stated choice for exploring the mechanic&rsquo;s impact — not a
+            claim that 30 bps was wrong. The 100%-to-protocol / 0%-to-insurance split is likewise a stated choice
+            for this round, distinct from the redemption fee&rsquo;s 50/50 and the yield fee&rsquo;s 2:1 — flagged
+            here so it reads as a decision, not an inconsistency. See <a href="/glossary">Origination fee</a>.
+          </Q>
         </ul>
       </Card>
     </>

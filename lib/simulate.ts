@@ -31,6 +31,10 @@ import {
   splitElb,
   instantRedemptionFeeBps,
   instantRedemptionFeeSplit,
+  splitYieldFee,
+  protocolBlendedApy,
+  splitOriginationFee,
+  originationFeeValue,
   type Tranche,
 } from './model';
 
@@ -48,6 +52,12 @@ export interface OriginationEvent {
   amount: number;
   apr: number;
   termMonths: number;
+  /** Fraction (e.g. 0.01 for 1%) — a one-time fee the BORROWER pays on top
+   * of their own equity, sized off this loan's own amount. Routed straight
+   * to the protocol wallet (100% — insurance gets none of this one); never
+   * touches v_fyc/v_ffc or mints anything — see splitOriginationFee in
+   * lib/model.ts. */
+  feePct: number;
 }
 
 export interface DefaultEvent {
@@ -56,13 +66,13 @@ export interface DefaultEvent {
   lossAmount: number;
 }
 
-/** A deposit (mint) or redemption (burn) against FYC or FFC. Priced at the
- * single v_tranche/supply price this simplified model uses throughout — the
- * real contract mints at the (higher) optimistic price and redeems at the
- * (lower) conservative price; distinguishing those would need this model to
- * track accrued-but-uncollected yield separately, which it doesn't. Flagged
- * here the same way the token-price section already flags no insurance-burn
- * defense being modeled. */
+/** A deposit (mint) or redemption (burn) against FYC or FFC. Mints price at
+ * the OPTIMISTIC estimate (v_tranche + this tranche's share of this
+ * period's not-yet-collected yield, so a depositor can't buy in cheap right
+ * before a yield sweep and dilute existing holders); redemptions — both
+ * instant and scheduled — price at the CONSERVATIVE figure (v_tranche only,
+ * nothing assumed). See runSimulation's step 1e below for exactly what "this
+ * period's yield" means in a period-stepped (not continuous-time) model. */
 export interface TrancheActivityEvent {
   id: string;
   period: number;
@@ -154,6 +164,11 @@ export interface SimStep {
   reservePrice: number;
   reserveObservedApyPct: number;
   loanObservedApyPct: number;
+  /** Capital-weighted blend of loanObservedApyPct and reserveObservedApyPct
+   * — "what is the protocol, as a whole, realizing right now" across BOTH
+   * yield streams, weighted by outstanding loans vs. idle reserve. See
+   * protocolBlendedApy in lib/model.ts. */
+  protocolBlendedApyPct: number;
   coveragePct: number;
   severity: number;
   k: number;
@@ -161,7 +176,6 @@ export interface SimStep {
   reserveNetYield: number;
   loanGrossInterest: number;
   loanNetYield: number;
-  feeValue: number;
   fycYield: number;
   ffcYield: number;
   fycReserveShare: number;
@@ -192,10 +206,36 @@ export interface SimStep {
   earmarkedCapital: number;
   /** This period's redemption-fee revenue, always settled as FYC, split
    * 50/50 — see instantRedemptionFeeSplit. */
-  protocolFeeFyc: number;
-  insuranceFeeFyc: number;
-  protocolFeeFycCum: number;
-  insuranceFeeFycCum: number;
+  redemptionFeeProtocol: number;
+  redemptionFeeInsurance: number;
+  redemptionFeeProtocolCum: number;
+  redemptionFeeInsuranceCum: number;
+  /** The 15% protocol fee skimmed off this period's yield (reserve +
+   * loans) and minted into FYC, split 2:1 protocol:insurance — see
+   * splitYieldFee. Distinct revenue stream from the redemption fee above:
+   * this one is funded by yield generation, not by redeeming users. */
+  loanFeeValue: number;
+  reserveFeeValue: number;
+  yieldFeeTotal: number;
+  yieldFeeProtocol: number;
+  yieldFeeInsurance: number;
+  yieldFeeProtocolCum: number;
+  yieldFeeInsuranceCum: number;
+  /** Optimistic (mint) price at the top of this period, before any of its
+   * own activity — includes this tranche's share of the period's
+   * not-yet-collected yield estimate. Contrast with fycPrice/ffcPrice
+   * above, which is always the conservative (redeem) price. */
+  fycOptimisticPrice: number;
+  ffcOptimisticPrice: number;
+  /** One-time fee the borrower pays on top of their own equity at
+   * origination — 100% to the protocol wallet, insurance gets none. Never
+   * touches fyc/ffc/fycSupply (see OriginationEvent.feePct in this file
+   * and splitOriginationFee in lib/model.ts) — a third, independent
+   * revenue stream alongside the redemption and yield fees above. */
+  originationFeeProtocol: number;
+  originationFeeInsurance: number;
+  originationFeeProtocolCum: number;
+  originationFeeInsuranceCum: number;
 }
 
 export interface SimResult {
@@ -216,15 +256,28 @@ export function runSimulation(config: ScenarioConfig): SimResult {
   // Redemption liquidity state — see /redemption.
   let pendingQueue: { tranche: Tranche; amount: number; requestPeriod: number; eligiblePeriod: number }[] = [];
   let earmarkedCapital = 0;
-  let protocolFeeFycCum = 0;
-  let insuranceFeeFycCum = 0;
+  let redemptionFeeProtocolCum = 0;
+  let redemptionFeeInsuranceCum = 0;
+  let yieldFeeProtocolCum = 0;
+  let yieldFeeInsuranceCum = 0;
+  // Origination fee — unlike the two above, this never touches fyc/ffc at
+  // all: it's a side payment from the borrower straight to the protocol
+  // wallet (100%, insurance gets none), tracked purely for revenue
+  // visibility. See splitOriginationFee in lib/model.ts.
+  let originationFeeProtocolCum = 0;
+  let originationFeeInsuranceCum = 0;
 
   // Token supply — set at genesis so price starts at exactly $1.00, then
-  // mutated by mint/redeem events. The 15% fee mint into FYC is price-neutral
-  // by construction (mints exactly fee_value/price_before new tokens) so it's
-  // left out of supply tracking here, same simplification as before.
+  // mutated by mint/redeem events. The 15% yield fee IS minted into FYC
+  // (price-neutral by construction — see step 4b) so it DOES affect
+  // fycSupply, same as any other mint.
   let fycSupply = config.initialFyc > 0 ? config.initialFyc : 1;
   let ffcSupply = config.initialFfc > 0 ? config.initialFfc : 1;
+
+  // $12,345.6 -> "12,346" — shared by every event-log detail string below so
+  // reserve/loan figures read consistently across mint, redeem, and
+  // scheduled-payout events.
+  const fmtInt = (n: number) => Math.round(n).toLocaleString();
 
   // Reserve token's own simulated price — the thing observed_source_apy_bps
   // actually watches. Starts at $1, compounds at the TRUE input rate every
@@ -271,6 +324,7 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     reservePrice,
     reserveObservedApyPct: 0,
     loanObservedApyPct: 0,
+    protocolBlendedApyPct: 0,
     coveragePct: 100,
     severity: 0,
     k: K_MIN, // no loan interest yet at period 0 — display-only
@@ -278,7 +332,6 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     reserveNetYield: 0,
     loanGrossInterest: 0,
     loanNetYield: 0,
-    feeValue: 0,
     fycYield: 0,
     ffcYield: 0,
     fycReserveShare: 0,
@@ -299,10 +352,23 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     pendingFyc: 0,
     pendingFfc: 0,
     earmarkedCapital: 0,
-    protocolFeeFyc: 0,
-    insuranceFeeFyc: 0,
-    protocolFeeFycCum: 0,
-    insuranceFeeFycCum: 0,
+    redemptionFeeProtocol: 0,
+    redemptionFeeInsurance: 0,
+    redemptionFeeProtocolCum: 0,
+    redemptionFeeInsuranceCum: 0,
+    loanFeeValue: 0,
+    reserveFeeValue: 0,
+    yieldFeeTotal: 0,
+    yieldFeeProtocol: 0,
+    yieldFeeInsurance: 0,
+    yieldFeeProtocolCum: 0,
+    yieldFeeInsuranceCum: 0,
+    fycOptimisticPrice: fycSupply > 0 ? fyc / fycSupply : 1,
+    ffcOptimisticPrice: ffcSupply > 0 ? ffc / ffcSupply : 1,
+    originationFeeProtocol: 0,
+    originationFeeInsurance: 0,
+    originationFeeProtocolCum: 0,
+    originationFeeInsuranceCum: 0,
   });
 
   for (let period = 1; period <= config.periods; period++) {
@@ -310,6 +376,17 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     const ffcStart = ffc;
 
     // 1. Loan book: collect levelized interest, pay down internal balances.
+    // internalPrincipal (monthlyPaymentAmt - levelizedInterestAmt) is
+    // algebraically constant every period — principal/termMonths exactly —
+    // so a loan's balance should hit EXACTLY 0 on its final period. In
+    // floating point it doesn't always: repeated subtraction of two
+    // independently-rounded values can leave a residue on the order of
+    // 1e-10. Left alone, that "active" loan keeps contributing its full
+    // levelizedInterestAmt to loanGrossInterest every period thereafter
+    // while `outstanding` sits at ~1e-10 — and loanObservedApyPct below
+    // divides by it, producing figures like 2.17e17%. BALANCE_DUST snaps
+    // the residue to exactly 0 (and out of the active-loan filter) instead.
+    const BALANCE_DUST = 1e-6;
     let loanGrossInterest = 0;
     for (const loan of loans) {
       if (loan.balance <= 0) continue;
@@ -319,6 +396,7 @@ export function runSimulation(config: ScenarioConfig): SimResult {
         loan.balance,
       );
       loan.balance = Math.max(0, loan.balance - principalPortion);
+      if (loan.balance < BALANCE_DUST) loan.balance = 0;
     }
     loans = loans.filter((l) => l.balance > 0);
     let outstanding = loans.reduce((sum, l) => sum + l.balance, 0);
@@ -332,9 +410,9 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     }
 
     // 1c. Scheduled (30d/90d queue) redemptions maturing this period — paid
-    // out NOW, at this period's price, never the price at submission (any
-    // yield/loss during the lock window is borne by the redeemer, matching
-    // the real contract's process_redemption). No fee on this path.
+    // out NOW, at this period's CONSERVATIVE price, never the price at
+    // submission (any yield/loss during the lock window is borne by the
+    // redeemer, matching the real contract's process_redemption). No fee.
     pendingQueue = pendingQueue.filter((req) => {
       if (req.eligiblePeriod > period) return true;
       const isFyc = req.tranche === 'fyc';
@@ -352,7 +430,7 @@ export function runSimulation(config: ScenarioConfig): SimResult {
       events.push({
         period,
         kind: 'redeem-processed',
-        detail: `$${Math.round(req.amount).toLocaleString()} ${req.tranche.toUpperCase()} scheduled redemption PAID at $${price.toFixed(4)}/token (submitted period ${req.requestPeriod}, no fee)`,
+        detail: `$${fmtInt(req.amount)} ${req.tranche.toUpperCase()} scheduled redemption PAID at $${price.toFixed(4)}/token (conservative, submitted period ${req.requestPeriod}, no fee) — reserve $${fmtInt(Math.max(0, fyc + ffc - outstanding))}, loans $${fmtInt(outstanding)}`,
       });
       return false;
     });
@@ -364,17 +442,56 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     const pendingAmount = (tranche: Tranche) =>
       pendingQueue.filter((r) => r.tranche === tranche).reduce((s, r) => s + r.amount, 0);
 
-    // 2. Mint/redeem activity — processed before this period's yield split,
-    // same treatment as freshly-repaid principal above: capital that shows
-    // up this period is already in v_tranche/reserve by the time yield gets
-    // split, capital that leaves stops earning it immediately.
-    let protocolFeeFyc = 0;
-    let insuranceFeeFyc = 0;
+    // 1d. Reserve token price tick, moved ahead of step 2 (was step 3) —
+    // this is deterministic, a pure function of the TRUE input rate, so it
+    // never actually depended on step 2's activity. Moved early because the
+    // OPTIMISTIC mint price below needs this period's reserve-yield
+    // estimate before step 2 runs.
+    const reservePriceBefore = reservePrice;
+    reservePrice = reservePrice * (1 + config.reserveApy / PERIODS_PER_YEAR);
+    const reserveObservedApy =
+      reservePriceBefore > 0 ? (reservePrice / reservePriceBefore - 1) * PERIODS_PER_YEAR : 0;
+
+    // 1e. This period's yield ESTIMATE, off pre-activity state — the basis
+    // for OPTIMISTIC (mint) pricing below. There's no sub-period clock to
+    // accrue against continuously the way the real contract's
+    // reward-per-second checkpoint does; the honest analog in a
+    // period-stepped model is "the yield this period's already-active loans
+    // and current reserve are KNOWN to generate, whether or not it's been
+    // swept into v_tranche yet" — computed from the exact same loans/
+    // reserve state steps 3/4 use to actually collect it moments later.
+    // Minting against v_tranche alone (ignoring this) would let a
+    // same-period depositor buy in cheap and immediately share in yield
+    // they contributed nothing to — precisely what optimistic pricing
+    // exists to prevent.
+    const reserveBeforeActivity = Math.max(0, fyc + ffc - outstanding);
+    const reserveGrossYieldEstimate = reserveBeforeActivity * (reserveObservedApy / PERIODS_PER_YEAR);
+    const reserveNetYieldEstimate = reserveGrossYieldEstimate * NET_YIELD_FRACTION;
+    const reserveSplitEstimate = splitBaseYieldTokenYield(reserveNetYieldEstimate, fyc, ffc);
+    const loanDistEstimate = distributeLoanInterest({ fyc, ffc, outstanding }, loanGrossInterest);
+    const fycYieldEstimate = reserveSplitEstimate.fycShare + loanDistEstimate.fycShare;
+    const ffcYieldEstimate = reserveSplitEstimate.ffcShare + loanDistEstimate.ffcShare;
+    // Snapshot for display (SimStep.fycOptimisticPrice/ffcOptimisticPrice)
+    // — the price a mint at the very TOP of this period, before any of its
+    // own activity, would have paid.
+    const fycOptimisticPriceAtOpen = fycSupply > 0 ? (fyc + fycYieldEstimate) / fycSupply : 1;
+    const ffcOptimisticPriceAtOpen = ffcSupply > 0 ? (ffc + ffcYieldEstimate) / ffcSupply : 1;
+
+    // 2. Mint/redeem activity — processed before this period's yield
+    // actually gets collected (steps 3/4), so capital arriving this period
+    // already earns it, and capital leaving stops immediately. Mints price
+    // OPTIMISTIC (v_tranche + this tranche's share of the 1e estimate, so a
+    // same-period depositor can't buy in below the yield that's about to
+    // land); every redemption path — instant or scheduled — prices
+    // CONSERVATIVE (v_tranche alone, nothing assumed). See the
+    // TrancheActivityEvent doc comment.
+    let redemptionFeeProtocol = 0;
+    let redemptionFeeInsurance = 0;
     for (const a of activityByPeriod.get(period) ?? []) {
       const isFyc = a.tranche === 'fyc';
       const value = isFyc ? fyc : ffc;
       const supply = isFyc ? fycSupply : ffcSupply;
-      const price = supply > 0 ? value / supply : 1;
+      const conservativePrice = supply > 0 ? value / supply : 1;
       if (a.kind === 'mint') {
         if (a.tranche === 'ffc') {
           const gate = assertMintAllowed({ fyc, ffc, outstanding });
@@ -382,12 +499,14 @@ export function runSimulation(config: ScenarioConfig): SimResult {
             events.push({
               period,
               kind: 'mint-blocked',
-              detail: `$${Math.round(a.amount).toLocaleString()} FFC mint BLOCKED — severity ${(gate.severity * 100).toFixed(2)}% ≤ ${(gate.threshold * 100).toFixed(0)}% floor`,
+              detail: `$${fmtInt(a.amount)} FFC mint BLOCKED — severity ${(gate.severity * 100).toFixed(2)}% ≤ ${(gate.threshold * 100).toFixed(0)}% floor`,
             });
             continue;
           }
         }
-        const tokensMinted = price > 0 ? a.amount / price : a.amount;
+        const yieldEstimate = isFyc ? fycYieldEstimate : ffcYieldEstimate;
+        const optimisticPrice = supply > 0 ? (value + yieldEstimate) / supply : 1;
+        const tokensMinted = optimisticPrice > 0 ? a.amount / optimisticPrice : a.amount;
         if (isFyc) {
           fyc += a.amount;
           fycSupply += tokensMinted;
@@ -398,7 +517,7 @@ export function runSimulation(config: ScenarioConfig): SimResult {
         events.push({
           period,
           kind: 'mint',
-          detail: `$${Math.round(a.amount).toLocaleString()} ${a.tranche.toUpperCase()} minted at $${price.toFixed(4)}/token (+${Math.round(tokensMinted).toLocaleString()} tokens)`,
+          detail: `$${fmtInt(a.amount)} ${a.tranche.toUpperCase()} minted at $${optimisticPrice.toFixed(4)}/token (optimistic — includes an est. $${fmtInt(yieldEstimate)} share of this period's not-yet-collected yield; +${Math.round(tokensMinted).toLocaleString()} tokens) — reserve $${fmtInt(Math.max(0, fyc + ffc - outstanding))}, loans $${fmtInt(outstanding)}`,
         });
       } else if (a.mode === 'scheduled') {
         const eligiblePeriod = period + LOCK_PERIODS[a.tranche];
@@ -406,7 +525,7 @@ export function runSimulation(config: ScenarioConfig): SimResult {
         events.push({
           period,
           kind: 'redeem-scheduled',
-          detail: `$${Math.round(a.amount).toLocaleString()} ${a.tranche.toUpperCase()} redemption SUBMITTED — eligible period ${eligiblePeriod} (${a.tranche === 'fyc' ? '30d' : '90d'} lock), no fee`,
+          detail: `$${fmtInt(a.amount)} ${a.tranche.toUpperCase()} redemption SUBMITTED — eligible period ${eligiblePeriod} (${a.tranche === 'fyc' ? '30d' : '90d'} lock), no fee, priced conservative when it matures`,
         });
       } else {
         // Instant (default when unset) — draws on this tranche's available
@@ -422,7 +541,7 @@ export function runSimulation(config: ScenarioConfig): SimResult {
           events.push({
             period,
             kind: 'redeem-blocked',
-            detail: `$${Math.round(a.amount).toLocaleString()} ${a.tranche.toUpperCase()} instant redemption BLOCKED — only $${Math.round(elbAvailable).toLocaleString()} of instant liquidity available; use the scheduled (${a.tranche === 'fyc' ? '30d' : '90d'}) queue instead`,
+            detail: `$${fmtInt(a.amount)} ${a.tranche.toUpperCase()} instant redemption BLOCKED — only $${fmtInt(elbAvailable)} of instant liquidity available; use the scheduled (${a.tranche === 'fyc' ? '30d' : '90d'}) queue instead`,
           });
           continue;
         }
@@ -432,59 +551,77 @@ export function runSimulation(config: ScenarioConfig): SimResult {
         if (isFyc) {
           // Fee-portion FYC tokens are never burned — only the net payout
           // leaves v_fyc/fyc_supply; the fee just changes ownership.
-          const tokensBurned = price > 0 ? fee.netPayout / price : 0;
+          const tokensBurned = conservativePrice > 0 ? fee.netPayout / conservativePrice : 0;
           fyc -= fee.netPayout;
           fycSupply = Math.max(0, fycSupply - tokensBurned);
         } else {
           // Full amount leaves FFC (net payout + the fee-portion, which gets
           // burned-and-converted rather than paid out) — see jr_to_sr.
-          const tokensBurned = price > 0 ? a.amount / price : 0;
+          const tokensBurned = conservativePrice > 0 ? a.amount / conservativePrice : 0;
           ffc -= a.amount;
           ffcSupply = Math.max(0, ffcSupply - tokensBurned);
           fyc += fee.feeValue;
           fycSupply += split.fycTokensMinted;
         }
-        protocolFeeFyc += split.protocolValueUsd;
-        insuranceFeeFyc += split.insuranceValueUsd;
+        redemptionFeeProtocol += split.protocolValueUsd;
+        redemptionFeeInsurance += split.insuranceValueUsd;
         events.push({
           period,
           kind: 'redeem',
-          detail: `$${Math.round(a.amount).toLocaleString()} ${a.tranche.toUpperCase()} redeemed INSTANTLY at $${price.toFixed(4)}/token — fee ${fee.feeBps.toFixed(2)}bps ($${fee.feeValue.toFixed(2)}, settled as FYC 50/50 protocol/insurance), net payout $${fee.netPayout.toFixed(2)}`,
+          detail: `$${fmtInt(a.amount)} ${a.tranche.toUpperCase()} redeemed INSTANTLY at $${conservativePrice.toFixed(4)}/token (conservative) — fee ${fee.feeBps.toFixed(2)}bps ($${fee.feeValue.toFixed(2)}, settled as FYC 50/50 protocol/insurance), net payout $${fee.netPayout.toFixed(2)} — reserve $${fmtInt(Math.max(0, fyc + ffc - outstanding))}, loans $${fmtInt(outstanding)}`,
         });
       }
     }
-    protocolFeeFycCum += protocolFeeFyc;
-    insuranceFeeFycCum += insuranceFeeFyc;
+    redemptionFeeProtocolCum += redemptionFeeProtocol;
+    redemptionFeeInsuranceCum += redemptionFeeInsurance;
 
-    // 3. Reserve yield — the reserve token's own price grows at the TRUE
-    // rate, then the period's yield is derived by observing that delta and
-    // annualizing it, exactly like observed_source_apy_bps. Because this
-    // reads the token's PRICE, not the reserve's dollar value or token
-    // count, minting/redeeming/repayments moving through step 2 above never
-    // distorts the estimate — the whole point of pricing yield off price,
-    // not balance.
-    const reservePriceBefore = reservePrice;
-    reservePrice = reservePrice * (1 + config.reserveApy / PERIODS_PER_YEAR);
-    const reserveObservedApy =
-      reservePriceBefore > 0
-        ? (reservePrice / reservePriceBefore - 1) * PERIODS_PER_YEAR
-        : 0;
+    // 3. Reserve yield, for real — same price tick from step 1d, but now
+    // reads POST-activity reserve (step 2 above may have moved it), not the
+    // pre-activity estimate step 1e used for mint pricing. The two can
+    // differ slightly whenever step 2 itself changed the reserve; expected,
+    // not a bug — see the 1e comment.
     const pool = fyc + ffc;
     const reserve = Math.max(0, pool - outstanding);
     const reserveGrossYield = reserve * (reserveObservedApy / PERIODS_PER_YEAR);
     const reserveNetYield = reserveGrossYield * NET_YIELD_FRACTION;
     const reserveSplit = splitBaseYieldTokenYield(reserveNetYield, fyc, ffc);
 
-    // 4. Loan interest — the severity-scaled premium curve.
+    // 4. Loan interest — the severity-scaled premium curve, for real
+    // (post-activity fyc/ffc/outstanding — may differ slightly from the
+    // step 1e estimate for the same reason as reserve yield above).
     const loanDist = distributeLoanInterest({ fyc, ffc, outstanding }, loanGrossInterest);
-    const loanObservedApy = outstanding > 0 ? (loanGrossInterest * PERIODS_PER_YEAR) / outstanding : 0;
+    // Defense in depth alongside BALANCE_DUST above: never divide by a
+    // sub-dollar outstanding figure, however it got that small. A ratio
+    // against a fraction of a cent isn't a meaningful "APY," it's noise.
+    const MIN_OUTSTANDING_FOR_APY = 1;
+    const loanObservedApy =
+      outstanding > MIN_OUTSTANDING_FOR_APY ? (loanGrossInterest * PERIODS_PER_YEAR) / outstanding : 0;
 
+    const fycPriceBeforeYield = fycSupply > 0 ? fyc / fycSupply : 1;
     const fycYield = reserveSplit.fycShare + loanDist.fycShare;
     const ffcYield = reserveSplit.ffcShare + loanDist.ffcShare;
     fyc += fycYield;
     ffc += ffcYield;
     fycCumYield += fycYield;
     ffcCumYield += ffcYield;
+
+    // 4b. Mint the 15% yield fee into FYC — price-neutral (priced off
+    // fycPriceBeforeYield, the instant before this period's net yield
+    // landed, so the mint neither dilutes nor gifts existing holders).
+    // Previously computed (loanDist.feeValue) but never actually added to
+    // v_fyc anywhere: gross yield came in, only the 85% net share ever
+    // showed up in the pool, and the fee just vanished from the model every
+    // period instead of doing what /glossary has always documented — mint
+    // new FYC, split 2:1 protocol:insurance.
+    const reserveFeeValue = reserveGrossYield - reserveNetYield;
+    const loanFeeValue = loanDist.feeValue;
+    const yieldFeeTotal = reserveFeeValue + loanFeeValue;
+    const yieldFeeTokensMinted = fycPriceBeforeYield > 0 ? yieldFeeTotal / fycPriceBeforeYield : yieldFeeTotal;
+    fyc += yieldFeeTotal;
+    fycSupply += yieldFeeTokensMinted;
+    const yieldFeeSplit = splitYieldFee(yieldFeeTotal);
+    yieldFeeProtocolCum += yieldFeeSplit.protocolValueUsd;
+    yieldFeeInsuranceCum += yieldFeeSplit.insuranceValueUsd;
 
     // 5. Defaults this period — FFC absorbs first, unchanged waterfall.
     let defaultLoss = 0;
@@ -518,6 +655,8 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     outstanding = loans.reduce((sum, l) => sum + l.balance, 0);
 
     // 6. Scheduled originations this period — gated on severity.
+    let originationFeeProtocol = 0;
+    let originationFeeInsurance = 0;
     for (const o of originationsByPeriod.get(period) ?? []) {
       const gate = assertOriginationAllowed({ fyc, ffc, outstanding }, o.amount, config.severityGateMax);
       if (gate.allowed) {
@@ -534,10 +673,18 @@ export function runSimulation(config: ScenarioConfig): SimResult {
           balance: o.amount,
         });
         outstanding += o.amount;
+        // Origination fee — a side payment the borrower makes ON TOP of
+        // their own equity, straight to the protocol wallet. Never touches
+        // fyc/ffc/fycSupply: this money doesn't come from or go into the
+        // pool at all, so there's nothing to mint or dilute.
+        const originationFeeAmount = originationFeeValue(o.amount, o.feePct);
+        const originationSplit = splitOriginationFee(originationFeeAmount);
+        originationFeeProtocol += originationSplit.protocolValueUsd;
+        originationFeeInsurance += originationSplit.insuranceValueUsd;
         events.push({
           period,
           kind: 'origination',
-          detail: `$${Math.round(o.amount).toLocaleString()} loan originated (severity ${(gate.severity * 100).toFixed(1)}% ≤ ${(gate.threshold * 100).toFixed(0)}%)`,
+          detail: `$${Math.round(o.amount).toLocaleString()} loan originated (severity ${(gate.severity * 100).toFixed(1)}% ≤ ${(gate.threshold * 100).toFixed(0)}%) — origination fee $${originationFeeAmount.toFixed(2)} (${(o.feePct * 100).toFixed(2)}% of principal, paid by borrower on top of equity, 100% to protocol wallet)`,
         });
       } else {
         events.push({
@@ -547,6 +694,8 @@ export function runSimulation(config: ScenarioConfig): SimResult {
         });
       }
     }
+    originationFeeProtocolCum += originationFeeProtocol;
+    originationFeeInsuranceCum += originationFeeInsurance;
 
     const coveragePct = coverageOf(outstanding, ffc) * 100;
     const severity = severityOf(outstanding, ffc, fyc);
@@ -571,6 +720,13 @@ export function runSimulation(config: ScenarioConfig): SimResult {
       reservePrice,
       reserveObservedApyPct: reserveObservedApy * 100,
       loanObservedApyPct: loanObservedApy * 100,
+      protocolBlendedApyPct:
+        protocolBlendedApy({
+          loanCapital: outstanding,
+          loanApy: loanObservedApy,
+          reserveCapital: Math.max(0, fyc + ffc - outstanding),
+          reserveApy: reserveObservedApy,
+        }) * 100,
       coveragePct,
       severity,
       k: loanDist.k,
@@ -578,7 +734,6 @@ export function runSimulation(config: ScenarioConfig): SimResult {
       reserveNetYield,
       loanGrossInterest,
       loanNetYield: loanDist.netYield,
-      feeValue: loanDist.feeValue,
       fycYield,
       ffcYield,
       fycReserveShare: reserveSplit.fycShare,
@@ -599,10 +754,23 @@ export function runSimulation(config: ScenarioConfig): SimResult {
       pendingFyc: pendingAmount('fyc'),
       pendingFfc: pendingAmount('ffc'),
       earmarkedCapital,
-      protocolFeeFyc,
-      insuranceFeeFyc,
-      protocolFeeFycCum,
-      insuranceFeeFycCum,
+      redemptionFeeProtocol,
+      redemptionFeeInsurance,
+      redemptionFeeProtocolCum,
+      redemptionFeeInsuranceCum,
+      loanFeeValue,
+      reserveFeeValue,
+      yieldFeeTotal,
+      yieldFeeProtocol: yieldFeeSplit.protocolValueUsd,
+      yieldFeeInsurance: yieldFeeSplit.insuranceValueUsd,
+      yieldFeeProtocolCum,
+      yieldFeeInsuranceCum,
+      fycOptimisticPrice: fycOptimisticPriceAtOpen,
+      ffcOptimisticPrice: ffcOptimisticPriceAtOpen,
+      originationFeeProtocol,
+      originationFeeInsurance,
+      originationFeeProtocolCum,
+      originationFeeInsuranceCum,
     });
   }
 

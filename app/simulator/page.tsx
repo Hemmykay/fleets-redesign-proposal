@@ -6,8 +6,8 @@ import { useSearchParams } from 'next/navigation';
 import LineChart from '@/components/LineChart';
 import { PageHeader, Card, Readout, Pill, Callout, Collapsible } from '@/components/ui';
 import { runSimulation, type OriginationEvent, type DefaultEvent, type TrancheActivityEvent } from '@/lib/simulate';
-import { generateRandomOriginations, generateRandomTrancheActivity } from '@/lib/random';
-import { fmtUSD, SEVERITY_MINT_FLOOR } from '@/lib/model';
+import { generateRandomOriginations, generateRandomTrancheActivity, generateRandomDefaults } from '@/lib/random';
+import { fmtUSD, SEVERITY_MINT_FLOOR, ORIGINATION_FEE_FRACTION } from '@/lib/model';
 import { useSeverityGate } from '@/components/SeverityGateContext';
 import { useSimulatorState } from '@/components/SimulatorStateContext';
 import { nextId } from '@/lib/idCounter';
@@ -41,6 +41,12 @@ function SimulatorPageInner() {
     randomAmountMax, setRandomAmountMax,
     randomFrequency, setRandomFrequency,
     randomTermMonths, setRandomTermMonths,
+    randomFeePctMin, setRandomFeePctMin,
+    randomFeePctMax, setRandomFeePctMax,
+    randomPushSeverity, setRandomPushSeverity,
+    randomDefaultMode, setRandomDefaultMode,
+    randomDefaultSeed, setRandomDefaultSeed,
+    randomDefaultAnnualRate, setRandomDefaultAnnualRate,
     trancheActivity, setTrancheActivity,
     randomActivityMode, setRandomActivityMode,
     randomActivitySeed, setRandomActivitySeed,
@@ -102,6 +108,17 @@ function SimulatorPageInner() {
   // randomization keeps going all the way to the real final duration instead
   // of stopping cold at the original input. Manual originations don't need
   // this — they're each pinned to an explicit period already.
+  // Pushing toward the severity gate needs fyc/ffc/gate as inputs — undefined
+  // (not just omitted) when the toggle is off, so generateRandomOriginations
+  // falls back cleanly to its original blind-random behavior. Memoized so
+  // its reference is stable across renders that don't actually change these
+  // inputs — otherwise a fresh object every render would bust the
+  // useMemo below on every single render, random inputs or not.
+  const severityTarget = useMemo(
+    () => (randomPushSeverity ? { fyc: initialFyc, ffc: initialFfc, severityGateMax: severityGateFraction } : undefined),
+    [randomPushSeverity, initialFyc, initialFfc, severityGateFraction],
+  );
+
   const randomOriginationsPass1 = useMemo(
     () =>
       generateRandomOriginations({
@@ -113,8 +130,11 @@ function SimulatorPageInner() {
         amountMin: randomAmountMin,
         amountMax: randomAmountMax,
         termMonths: randomTermMonths,
+        feePctMin: randomFeePctMin,
+        feePctMax: randomFeePctMax,
+        severityTarget,
       }),
-    [randomSeed, periods, randomFrequency, randomAprMin, randomAprMax, randomAmountMin, randomAmountMax, randomTermMonths],
+    [randomSeed, periods, randomFrequency, randomAprMin, randomAprMax, randomAmountMin, randomAmountMax, randomTermMonths, randomFeePctMin, randomFeePctMax, severityTarget],
   );
   const effectiveOriginationsPass1 = randomMode ? randomOriginationsPass1 : originations;
   const durationPass1 = effectiveOriginationsPass1.reduce((max, o) => Math.max(max, o.period + o.termMonths), periods);
@@ -131,9 +151,12 @@ function SimulatorPageInner() {
             amountMin: randomAmountMin,
             amountMax: randomAmountMax,
             termMonths: randomTermMonths,
+            feePctMin: randomFeePctMin,
+            feePctMax: randomFeePctMax,
+            severityTarget,
           })
         : randomOriginationsPass1,
-    [randomMode, randomSeed, durationPass1, randomFrequency, randomAprMin, randomAprMax, randomAmountMin, randomAmountMax, randomTermMonths, randomOriginationsPass1],
+    [randomMode, randomSeed, durationPass1, randomFrequency, randomAprMin, randomAprMax, randomAmountMin, randomAmountMax, randomTermMonths, randomFeePctMin, randomFeePctMax, severityTarget, randomOriginationsPass1],
   );
   const effectiveOriginations = randomMode ? randomOriginationsFinal : originations;
 
@@ -163,6 +186,21 @@ function SimulatorPageInner() {
   );
   const effectiveTrancheActivity = randomActivityMode ? randomTrancheActivity : trancheActivity;
 
+  // Defaults driven by a single blended annual rate against whatever loan
+  // book is currently in play (random or manual originations, whichever is
+  // effective) — no min/max/frequency knobs, just "this book, this rate."
+  const randomDefaults = useMemo(
+    () =>
+      generateRandomDefaults({
+        seed: randomDefaultSeed,
+        periods: effectivePeriods,
+        annualDefaultRate: randomDefaultAnnualRate,
+        originations: effectiveOriginations,
+      }),
+    [randomDefaultSeed, effectivePeriods, randomDefaultAnnualRate, effectiveOriginations],
+  );
+  const effectiveDefaults = randomDefaultMode ? randomDefaults : defaults;
+
   const result = useMemo(
     () =>
       runSimulation({
@@ -171,28 +209,39 @@ function SimulatorPageInner() {
         reserveApy,
         periods: effectivePeriods,
         originations: effectiveOriginations,
-        defaults,
+        defaults: effectiveDefaults,
         trancheActivity: effectiveTrancheActivity,
         severityGateMax: severityGateFraction,
       }),
-    [initialFyc, initialFfc, reserveApy, effectivePeriods, effectiveOriginations, defaults, effectiveTrancheActivity, severityGateFraction],
+    [initialFyc, initialFfc, reserveApy, effectivePeriods, effectiveOriginations, effectiveDefaults, effectiveTrancheActivity, severityGateFraction],
   );
 
   useEffect(() => {
     setCursor((c) => Math.min(c, effectivePeriods));
   }, [effectivePeriods]);
 
+  // Stopping playback once cursor reaches the end is a render-time state
+  // adjustment (React's sanctioned pattern for this — see
+  // react.dev/learn/you-might-not-need-an-effect#adjusting-state-based-on-a-prop-change),
+  // not a useEffect. Two reasons it can't be an effect: (1) cursor is
+  // lifted state owned by SimulatorStateProvider while playing is local to
+  // this component, so calling setPlaying from inside setCursor's own
+  // updater — the original bug here — is a cross-component
+  // setState-during-render React explicitly flags; (2) this repo's lint
+  // config (react-hooks/set-state-in-effect) also rejects a plain
+  // setState call in a bare effect body. Calling it here instead is safe
+  // from an infinite loop without any extra guard: the condition itself
+  // (`playing && cursor >= effectivePeriods`) goes false the instant
+  // setPlaying(false) takes effect, so it converges in one extra render.
+  if (playing && cursor >= effectivePeriods) {
+    setPlaying(false);
+  }
+
   useEffect(() => {
     if (playing) {
       const intervalMs = Math.max(16, (playbackSeconds * 1000) / Math.max(1, effectivePeriods));
       timerRef.current = setInterval(() => {
-        setCursor((c) => {
-          if (c >= effectivePeriods) {
-            setPlaying(false);
-            return c;
-          }
-          return c + 1;
-        });
+        setCursor((c) => (c >= effectivePeriods ? c : c + 1));
       }, intervalMs);
     }
     return () => {
@@ -200,11 +249,23 @@ function SimulatorPageInner() {
     };
   }, [playing, effectivePeriods, playbackSeconds]);
 
-  const step = result.steps[cursor] ?? result.steps[result.steps.length - 1];
-  const eventsAtCursor = result.events.filter((e) => e.period === cursor);
+  // cursor is lifted state (SimulatorStateProvider) clamped to effectivePeriods
+  // by the effect above — but effects run AFTER commit, so on the very render
+  // where effectivePeriods just shrank (e.g. an input change), cursor can
+  // still be stale-high for this one pass. result.steps only has indices up
+  // to effectivePeriods, so indexing with a stale cursor crashes. Read
+  // through this clamped local instead of raw cursor anywhere that touches
+  // result.steps/result.events by period — cursor itself still gets fixed
+  // for real via the effect, this is just making the current render safe.
+  const safeCursor = Math.min(cursor, effectivePeriods);
+  const step = result.steps[safeCursor] ?? result.steps[result.steps.length - 1];
+  const eventsAtCursor = result.events.filter((e) => e.period === safeCursor);
 
   function addOrigination() {
-    setOriginations((prev) => [...prev, { id: nextId(), period: 1, amount: 100000, apr: 0.15, termMonths: 36 }]);
+    setOriginations((prev) => [
+      ...prev,
+      { id: nextId(), period: 1, amount: 100000, apr: 0.15, termMonths: 36, feePct: ORIGINATION_FEE_FRACTION },
+    ]);
   }
   function addDefault() {
     setDefaults((prev) => [...prev, { id: nextId(), period: 6, lossAmount: 50000 }]);
@@ -215,9 +276,16 @@ function SimulatorPageInner() {
 
   const maxBalance = Math.max(initialFyc, initialFfc, ...result.steps.map((s) => Math.max(s.fyc, s.ffc)));
   const maxPct = Math.max(60, ...result.steps.map((s) => Math.max(s.coveragePct, s.severity * 100)));
-  const maxApy = Math.max(10, ...result.steps.map((s) => Math.max(s.fycApyAnnualized, s.ffcApyAnnualized)));
-  const maxPrice = Math.max(1.1, ...result.steps.map((s) => Math.max(s.fycPrice, s.ffcPrice))) * 1.05;
-  const minPrice = Math.min(0.9, ...result.steps.map((s) => Math.min(s.fycPrice, s.ffcPrice))) * 0.98;
+  const maxApy = Math.max(
+    10,
+    ...result.steps.map((s) => Math.max(s.fycApyAnnualized, s.ffcApyAnnualized, s.protocolBlendedApyPct)),
+  );
+  const maxPrice =
+    Math.max(1.1, ...result.steps.map((s) => Math.max(s.fycPrice, s.ffcPrice, s.fycOptimisticPrice, s.ffcOptimisticPrice))) *
+    1.05;
+  const minPrice =
+    Math.min(0.9, ...result.steps.map((s) => Math.min(s.fycPrice, s.ffcPrice, s.fycOptimisticPrice, s.ffcOptimisticPrice))) *
+    0.98;
 
   return (
     <>
@@ -274,6 +342,7 @@ function SimulatorPageInner() {
                   <MiniField label="amount $" value={o.amount} onChange={(v) => updateOrig(setOriginations, o.id, { amount: v })} step={5000} />
                   <MiniField label="apr %" value={o.apr * 100} onChange={(v) => updateOrig(setOriginations, o.id, { apr: v / 100 })} step={0.5} />
                   <MiniField label="term (mo)" value={o.termMonths} onChange={(v) => updateOrig(setOriginations, o.id, { termMonths: Math.round(v) })} step={1} />
+                  <MiniField label="origination fee %" value={o.feePct * 100} onChange={(v) => updateOrig(setOriginations, o.id, { feePct: v / 100 })} step={0.1} />
                 </EventRow>
               ))}
               <button className="pill neutral" style={{ cursor: 'pointer', border: 'none', marginTop: 8 }} onClick={addOrigination}>
@@ -289,7 +358,13 @@ function SimulatorPageInner() {
                 <MiniField label="amount max $" value={randomAmountMax} onChange={setRandomAmountMax} step={10000} />
                 <MiniField label="every ~N periods" value={randomFrequency} onChange={(v) => setRandomFrequency(Math.max(1, Math.round(v)))} step={1} />
                 <MiniField label="term (mo)" value={randomTermMonths} onChange={(v) => setRandomTermMonths(Math.max(1, Math.round(v)))} step={1} />
+                <MiniField label="origination fee min %" value={randomFeePctMin * 100} onChange={(v) => setRandomFeePctMin(v / 100)} step={0.1} />
+                <MiniField label="origination fee max %" value={randomFeePctMax * 100} onChange={(v) => setRandomFeePctMax(v / 100)} step={0.1} />
               </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer', marginBottom: 10 }}>
+                <input type="checkbox" checked={randomPushSeverity} onChange={(e) => setRandomPushSeverity(e.target.checked)} />
+                push toward severity gate ({severityGateMax}%)
+              </label>
               <button
                 className="pill neutral"
                 style={{ cursor: 'pointer', border: 'none', marginBottom: 10 }}
@@ -299,8 +374,12 @@ function SimulatorPageInner() {
               </button>
               <p className="section-dek" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
                 {randomOriginationsFinal.length} loan{randomOriginationsFinal.length === 1 ? '' : 's'} generated, APR{' '}
-                {(randomAprMin * 100).toFixed(1)}%–{(randomAprMax * 100).toFixed(1)}%. Deterministic per seed — scrubbing
-                the playhead won&rsquo;t reshuffle it, only &ldquo;reroll&rdquo; will.
+                {(randomAprMin * 100).toFixed(1)}%–{(randomAprMax * 100).toFixed(1)}%, origination fee{' '}
+                {(randomFeePctMin * 100).toFixed(1)}%–{(randomFeePctMax * 100).toFixed(1)}%.{' '}
+                {randomPushSeverity
+                  ? `Sized every period to push the book toward the ${severityGateMax}% severity gate — denser and larger than blind random sampling as headroom allows.`
+                  : 'Amounts drawn blind from the range above, regardless of headroom.'}{' '}
+                Deterministic per seed — scrubbing the playhead won&rsquo;t reshuffle it, only &ldquo;reroll&rdquo; will.
               </p>
               <div style={{ maxHeight: 140, overflowY: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--text-secondary)' }}>
                 {randomOriginationsFinal.map((o) => (
@@ -308,6 +387,7 @@ function SimulatorPageInner() {
                     <span style={{ color: 'var(--text-muted)', minWidth: 40 }}>p{o.period}</span>
                     <span>{fmtUSD(o.amount)}</span>
                     <span>{(o.apr * 100).toFixed(2)}% APR</span>
+                    <span style={{ color: 'var(--text-muted)' }}>{(o.feePct * 100).toFixed(2)}% fee</span>
                   </div>
                 ))}
               </div>
@@ -315,21 +395,58 @@ function SimulatorPageInner() {
           )}
         </Card>
         <Card>
-          <h3>Default events</h3>
-          <p className="section-dek" style={{ fontSize: 12, marginBottom: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+            <h3 style={{ margin: 0 }}>Default events</h3>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+              <input type="checkbox" checked={randomDefaultMode} onChange={(e) => setRandomDefaultMode(e.target.checked)} />
+              randomize
+            </label>
+          </div>
+          <p className="section-dek" style={{ fontSize: 12, marginTop: 6, marginBottom: 10 }}>
             A dollar amount of the loan book written off at a given period. FFC absorbs first, up to its full
             value; FYC absorbs any remainder.
           </p>
-          {defaults.length === 0 && <p style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>No defaults configured — a clean run.</p>}
-          {defaults.map((d) => (
-            <EventRow key={d.id} onRemove={() => setDefaults((prev) => prev.filter((x) => x.id !== d.id))}>
-              <MiniField label="period" value={d.period} onChange={(v) => updateDef(setDefaults, d.id, { period: v })} />
-              <MiniField label="loss $" value={d.lossAmount} onChange={(v) => updateDef(setDefaults, d.id, { lossAmount: v })} step={5000} />
-            </EventRow>
-          ))}
-          <button className="pill neutral" style={{ cursor: 'pointer', border: 'none', marginTop: 8 }} onClick={addDefault}>
-            + add default
-          </button>
+          {!randomDefaultMode ? (
+            <>
+              {defaults.length === 0 && <p style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>No defaults configured — a clean run.</p>}
+              {defaults.map((d) => (
+                <EventRow key={d.id} onRemove={() => setDefaults((prev) => prev.filter((x) => x.id !== d.id))}>
+                  <MiniField label="period" value={d.period} onChange={(v) => updateDef(setDefaults, d.id, { period: v })} />
+                  <MiniField label="loss $" value={d.lossAmount} onChange={(v) => updateDef(setDefaults, d.id, { lossAmount: v })} step={5000} />
+                </EventRow>
+              ))}
+              <button className="pill neutral" style={{ cursor: 'pointer', border: 'none', marginTop: 8 }} onClick={addDefault}>
+                + add default
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+                <MiniField label="blended annual default rate %" value={randomDefaultAnnualRate * 100} onChange={(v) => setRandomDefaultAnnualRate(Math.max(0, v / 100))} step={0.5} />
+              </div>
+              <button
+                className="pill neutral"
+                style={{ cursor: 'pointer', border: 'none', marginBottom: 10 }}
+                onClick={() => setRandomDefaultSeed((s) => s + 1)}
+              >
+                🎲 reroll (seed {randomDefaultSeed})
+              </button>
+              <p className="section-dek" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                {randomDefaults.length} default event{randomDefaults.length === 1 ? '' : 's'} generated against the
+                current loan book, sized off {(randomDefaultAnnualRate * 100).toFixed(1)}%/year applied to each
+                period&rsquo;s estimated outstanding balance — one knob, not min/max/frequency. Deterministic per
+                seed — scrubbing the playhead won&rsquo;t reshuffle it, only &ldquo;reroll&rdquo; will.
+              </p>
+              <div style={{ maxHeight: 140, overflowY: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                {randomDefaults.map((d) => (
+                  <div key={d.id} style={{ display: 'flex', gap: 10, padding: '3px 0' }}>
+                    <span style={{ color: 'var(--text-muted)', minWidth: 40 }}>p{d.period}</span>
+                    <span>{fmtUSD(d.lossAmount)}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </Card>
       </div>
 
@@ -344,9 +461,10 @@ function SimulatorPageInner() {
         <p className="section-dek" style={{ fontSize: 12, marginTop: 6, marginBottom: 10 }}>
           Deposits (mint) and withdrawals (redeem) against either tranche — same mechanism as loan
           originations, generated the same way. FFC mints are checked against the mint floor when their period
-          arrives; a blocked mint shows up in the event log, same as a blocked origination. Priced at this
-          model&rsquo;s single v_tranche/supply price — the real contract mints at the optimistic price and
-          redeems at the conservative one, which this simplified model doesn&rsquo;t distinguish. Redeem rows
+          arrives; a blocked mint shows up in the event log, same as a blocked origination. Mints price at the{' '}
+          <b>optimistic</b> price (v_tranche plus this period&rsquo;s not-yet-collected yield estimate); every
+          redemption — instant or scheduled — prices at the <b>conservative</b> one (v_tranche alone), matching
+          the real contract&rsquo;s mint-high/redeem-low split. Redeem rows
           default to <b>instant</b> — capped at that tranche&rsquo;s available ELB liquidity (see /redemption)
           at a liquidity-scaled fee, settled as FYC into the protocol/insurance wallets — or can be switched to{' '}
           <b>scheduled</b>, which queues for the 30d/90d lock and pays out fee-free once eligible.
@@ -420,7 +538,7 @@ function SimulatorPageInner() {
 
       <Card style={{ marginTop: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6, flexWrap: 'wrap', gap: 8 }}>
-          <h3 style={{ margin: 0 }}>Playback — period {cursor} of {effectivePeriods}</h3>
+          <h3 style={{ margin: 0 }}>Playback — period {safeCursor} of {effectivePeriods}</h3>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>
               play over
@@ -474,7 +592,7 @@ function SimulatorPageInner() {
           min={0}
           max={effectivePeriods}
           step={1}
-          value={cursor}
+          value={safeCursor}
           onChange={(e) => {
             setPlaying(false);
             setCursor(+e.target.value);
@@ -482,9 +600,23 @@ function SimulatorPageInner() {
         />
 
         <div className="readout-grid" style={{ marginTop: 16, marginBottom: 16 }}>
-          <Readout label="FYC value / price" value={`${fmtUSD(step.fyc)} · $${step.fycPrice.toFixed(4)}`} sub={`${step.fycApyAnnualized.toFixed(2)}% annualized this period · ${Math.round(step.fycSupply).toLocaleString()} tokens`} color="var(--fyc)" />
-          <Readout label="FFC value / price" value={`${fmtUSD(step.ffc)} · $${step.ffcPrice.toFixed(4)}`} sub={`${step.ffcApyAnnualized.toFixed(2)}% annualized this period · ${Math.round(step.ffcSupply).toLocaleString()} tokens`} color="var(--ffc)" />
-          <Readout label="Outstanding / active loans" value={fmtUSD(step.outstanding)} sub={`${step.activeLoanCount} active loan(s)`} />
+          <Readout
+            label="FYC value / price — redeem · mint"
+            value={`${fmtUSD(step.fyc)} · $${step.fycPrice.toFixed(4)} · $${step.fycOptimisticPrice.toFixed(4)}`}
+            sub={`${step.fycApyAnnualized.toFixed(2)}% annualized this period · ${Math.round(step.fycSupply).toLocaleString()} tokens`}
+            color="var(--fyc)"
+          />
+          <Readout
+            label="FFC value / price — redeem · mint"
+            value={`${fmtUSD(step.ffc)} · $${step.ffcPrice.toFixed(4)} · $${step.ffcOptimisticPrice.toFixed(4)}`}
+            sub={`${step.ffcApyAnnualized.toFixed(2)}% annualized this period · ${Math.round(step.ffcSupply).toLocaleString()} tokens`}
+            color="var(--ffc)"
+          />
+          <Readout
+            label="Reserve vs. loans deployed"
+            value={`${fmtUSD(step.reserve)} reserve / ${fmtUSD(step.outstanding)} loans`}
+            sub={`${step.activeLoanCount} active loan(s) · ${(step.fyc + step.ffc > 0 ? (step.reserve / (step.fyc + step.ffc)) * 100 : 0).toFixed(1)}% idle, ${(step.fyc + step.ffc > 0 ? (step.outstanding / (step.fyc + step.ffc)) * 100 : 0).toFixed(1)}% deployed`}
+          />
           <Readout label="Coverage / severity" value={`${step.coveragePct.toFixed(1)}% / ${(step.severity * 100).toFixed(2)}%`} sub={`k = ${step.k.toFixed(2)}×`} />
           <Readout
             label="Reserve APY — observed / true"
@@ -494,7 +626,16 @@ function SimulatorPageInner() {
           <Readout
             label="Loan book APY — blended"
             value={`${step.loanObservedApyPct.toFixed(2)}%`}
-            sub="realized rate across all active loans right now, not any single loan's own APR"
+            sub={
+              step.outstanding > 1
+                ? "realized rate across all active loans right now, not any single loan's own APR"
+                : 'no meaningful outstanding balance this period — shown as 0% rather than an unstable ratio'
+            }
+          />
+          <Readout
+            label="Protocol APY — blended (loans + reserve)"
+            value={`${step.protocolBlendedApyPct.toFixed(2)}%`}
+            sub={`capital-weighted: ${fmtUSD(step.outstanding)} loans @ ${step.loanObservedApyPct.toFixed(2)}% + ${fmtUSD(step.reserve)} reserve @ ${step.reserveObservedApyPct.toFixed(2)}% — see protocolBlendedApy`}
           />
           <Readout
             label="Instant liquidity (ELB) — FYC / FFC"
@@ -502,9 +643,31 @@ function SimulatorPageInner() {
             sub={`${fmtUSD(step.earmarkedCapital)} earmarked · pending queue ${fmtUSD(step.pendingFyc)} FYC / ${fmtUSD(step.pendingFfc)} FFC`}
           />
           <Readout
-            label="Redemption fee revenue (as FYC)"
-            value={`${fmtUSD(step.protocolFeeFycCum)} protocol / ${fmtUSD(step.insuranceFeeFycCum)} insurance`}
-            sub={step.protocolFeeFyc + step.insuranceFeeFyc > 0 ? `+${fmtUSD(step.protocolFeeFyc + step.insuranceFeeFyc)} this period` : 'cumulative — see /redemption'}
+            label="Protocol revenue — redemption fees (as FYC)"
+            value={`${fmtUSD(step.redemptionFeeProtocolCum)} protocol / ${fmtUSD(step.redemptionFeeInsuranceCum)} insurance`}
+            sub={
+              step.redemptionFeeProtocol + step.redemptionFeeInsurance > 0
+                ? `+${fmtUSD(step.redemptionFeeProtocol + step.redemptionFeeInsurance)} this period — paid by redeeming users`
+                : 'cumulative — see /redemption'
+            }
+          />
+          <Readout
+            label="Protocol revenue — yield fee (loans + reserve, as FYC)"
+            value={`${fmtUSD(step.yieldFeeProtocolCum)} protocol / ${fmtUSD(step.yieldFeeInsuranceCum)} insurance`}
+            sub={
+              step.yieldFeeTotal > 0
+                ? `+${fmtUSD(step.loanFeeValue)} from loans, +${fmtUSD(step.reserveFeeValue)} from reserve this period`
+                : 'cumulative — 15% of gross yield, minted price-neutral into FYC'
+            }
+          />
+          <Readout
+            label="Protocol revenue — origination fee (USDC, off-pool)"
+            value={fmtUSD(step.originationFeeProtocolCum)}
+            sub={
+              step.originationFeeProtocol > 0
+                ? `+${fmtUSD(step.originationFeeProtocol)} this period — 100% protocol, paid by borrowers on top of equity`
+                : 'cumulative — never touches v_fyc/v_ffc, see /glossary'
+            }
           />
         </div>
 
@@ -563,16 +726,16 @@ function SimulatorPageInner() {
           ]}
         />
 
-        <h3 style={{ marginTop: 24 }}>Token price over time</h3>
+        <h3 style={{ marginTop: 24 }}>Token price over time — redeem (solid) vs. mint (dashed)</h3>
         <p className="section-dek" style={{ fontSize: 12, marginBottom: 10 }}>
-          NAV per token — <code>v_tranche / total_supply</code>, both starting at $1.00 by construction. Mint
-          and redeem events below move both value and supply together at the price in effect that period, so
-          price stays continuous across them. The 15% fee-mint into FYC is price-neutral by construction (it
-          mints exactly enough new tokens to leave price unchanged), so it&rsquo;s left out of supply tracking
-          entirely. This model prices every mint and redeem at the same single NAV — the real contract mints at
-          the (higher) optimistic price and redeems at the (lower) conservative one, which this simplified
-          model doesn&rsquo;t distinguish. FYC also has no insurance-burn price defense modeled here — a
-          default drops its price directly.
+          NAV per token — <code>v_tranche / total_supply</code>, both starting at $1.00 by construction. The
+          solid lines are the <b>conservative</b> price every redemption pays; the dashed lines are the{' '}
+          <b>optimistic</b> price mints pay, running slightly above solid since it includes a tranche&rsquo;s
+          share of that period&rsquo;s not-yet-collected yield — the real contract&rsquo;s actual mint-high/
+          redeem-low split, not a single shared NAV. The 15% yield fee mints new FYC price-neutrally (exactly
+          enough tokens to leave the conservative price unchanged), so it moves supply without bending either
+          line on its own. FYC also has no insurance-burn price defense modeled here — a default drops its
+          price directly.
         </p>
         <LineChart
           xDomain={[0, effectivePeriods]}
@@ -584,8 +747,22 @@ function SimulatorPageInner() {
           hLines={[{ y: 1, label: '$1.00 genesis price', color: 'var(--text-muted)' }]}
           vLines={[{ x: cursor, color: 'var(--text-primary)', dashed: false }]}
           series={[
-            { name: 'FYC price', color: 'var(--fyc)', points: result.steps.map((s) => ({ x: s.period, y: s.fycPrice })) },
-            { name: 'FFC price', color: 'var(--ffc)', points: result.steps.map((s) => ({ x: s.period, y: s.ffcPrice })) },
+            { name: 'FYC redeem', color: 'var(--fyc)', points: result.steps.map((s) => ({ x: s.period, y: s.fycPrice })) },
+            { name: 'FFC redeem', color: 'var(--ffc)', points: result.steps.map((s) => ({ x: s.period, y: s.ffcPrice })) },
+            {
+              name: 'FYC mint',
+              color: 'var(--fyc)',
+              points: result.steps.map((s) => ({ x: s.period, y: s.fycOptimisticPrice })),
+              dashed: true,
+              width: 1.5,
+            },
+            {
+              name: 'FFC mint',
+              color: 'var(--ffc)',
+              points: result.steps.map((s) => ({ x: s.period, y: s.ffcOptimisticPrice })),
+              dashed: true,
+              width: 1.5,
+            },
           ]}
         />
 
@@ -617,6 +794,13 @@ function SimulatorPageInner() {
           series={[
             { name: 'FYC APY', color: 'var(--fyc)', points: result.steps.map((s) => ({ x: s.period, y: s.fycApyAnnualized })) },
             { name: 'FFC APY', color: 'var(--ffc)', points: result.steps.map((s) => ({ x: s.period, y: s.ffcApyAnnualized })) },
+            {
+              name: 'Protocol blended APY',
+              color: 'var(--text-muted)',
+              points: result.steps.map((s) => ({ x: s.period, y: s.protocolBlendedApyPct })),
+              dashed: true,
+              width: 1.5,
+            },
           ]}
         />
       </Card>
@@ -627,12 +811,13 @@ function SimulatorPageInner() {
           One row per month — click any month to see exactly how its yield split, who minted or redeemed, and
           what defaulted or originated.
         </p>
-        {cursor === 0 ? (
+        {safeCursor === 0 ? (
           <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>Nothing has happened yet — advance the playhead.</p>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 420, overflowY: 'auto' }}>
-            {Array.from({ length: cursor }, (_, i) => cursor - i).map((p) => {
+            {Array.from({ length: safeCursor }, (_, i) => safeCursor - i).map((p) => {
               const s = result.steps[p];
+              if (!s) return null;
               const monthEvents = result.events.filter((e) => e.period === p);
               const open = expandedMonths.has(p);
               const hasFlag = monthEvents.some((e) => e.kind === 'origination-blocked' || e.kind === 'mint-blocked' || e.kind === 'default');
@@ -668,6 +853,9 @@ function SimulatorPageInner() {
                       FYC <b style={{ color: 'var(--fyc)' }}>+{fmtUSD(s.fycYield)}</b> · FFC{' '}
                       <b style={{ color: 'var(--ffc)' }}>+{fmtUSD(s.ffcYield)}</b>
                     </span>
+                    <span style={{ color: 'var(--text-muted)' }}>
+                      · reserve {fmtUSD(s.reserve)} / loans {fmtUSD(s.outstanding)}
+                    </span>
                     {monthEvents.length > 0 && (
                       <span style={{ color: 'var(--text-muted)' }}>
                         · {monthEvents.length} event{monthEvents.length === 1 ? '' : 's'}
@@ -678,9 +866,12 @@ function SimulatorPageInner() {
                     <div style={{ padding: '10px 14px 14px', borderTop: '1px solid var(--border)', fontSize: 12.5 }}>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 10 }}>
                         <div>
-                          <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 3 }}>RESERVE YIELD</div>
+                          <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 3 }}>
+                            RESERVE YIELD — reserve balance {fmtUSD(s.reserve)}
+                          </div>
                           <div>
-                            gross {fmtUSD(s.reserveGrossYield)} → net {fmtUSD(s.reserveNetYield)} (85%)
+                            gross {fmtUSD(s.reserveGrossYield)} → net {fmtUSD(s.reserveNetYield)} (85%), fee{' '}
+                            {fmtUSD(s.reserveFeeValue)} (15%, mints new FYC)
                             <br />
                             observed APY {s.reserveObservedApyPct.toFixed(3)}%, price ${s.reservePrice.toFixed(4)}
                             <br />
@@ -690,10 +881,12 @@ function SimulatorPageInner() {
                           </div>
                         </div>
                         <div>
-                          <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 3 }}>LOAN INTEREST</div>
+                          <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 3 }}>
+                            LOAN INTEREST — outstanding {fmtUSD(s.outstanding)}
+                          </div>
                           <div>
                             gross {fmtUSD(s.loanGrossInterest)} → net {fmtUSD(s.loanNetYield)} (85%), fee{' '}
-                            {fmtUSD(s.feeValue)} (15%, mints new FYC)
+                            {fmtUSD(s.loanFeeValue)} (15%, mints new FYC)
                             <br />
                             blended book APY {s.loanObservedApyPct.toFixed(2)}%, k = {s.k.toFixed(2)}×, coverage{' '}
                             {s.coveragePct.toFixed(1)}%, severity {(s.severity * 100).toFixed(2)}%
@@ -701,6 +894,33 @@ function SimulatorPageInner() {
                             FYC <b style={{ color: 'var(--fyc)' }}>{fmtUSD(s.fycLoanShare)}</b> · FFC{' '}
                             <b style={{ color: 'var(--ffc)' }}>{fmtUSD(s.ffcLoanShare)}</b> — severity-curve split
                           </div>
+                        </div>
+                      </div>
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 3 }}>
+                          PROTOCOL REVENUE THIS PERIOD
+                        </div>
+                        <div>
+                          yield fee {fmtUSD(s.yieldFeeTotal)} (loans {fmtUSD(s.loanFeeValue)} + reserve{' '}
+                          {fmtUSD(s.reserveFeeValue)}) → protocol{' '}
+                          <b style={{ color: 'var(--fyc)' }}>{fmtUSD(s.yieldFeeProtocol)}</b> / insurance{' '}
+                          <b>{fmtUSD(s.yieldFeeInsurance)}</b> (2:1 split)
+                          {s.redemptionFeeProtocol + s.redemptionFeeInsurance > 0 && (
+                            <>
+                              <br />
+                              redemption fee {fmtUSD(s.redemptionFeeProtocol + s.redemptionFeeInsurance)} → protocol{' '}
+                              <b style={{ color: 'var(--fyc)' }}>{fmtUSD(s.redemptionFeeProtocol)}</b> / insurance{' '}
+                              <b>{fmtUSD(s.redemptionFeeInsurance)}</b> (50:50 split)
+                            </>
+                          )}
+                          {s.originationFeeProtocol > 0 && (
+                            <>
+                              <br />
+                              origination fee {fmtUSD(s.originationFeeProtocol)} → protocol{' '}
+                              <b style={{ color: 'var(--fyc)' }}>{fmtUSD(s.originationFeeProtocol)}</b> (100%, paid by
+                              borrower, never touches v_fyc/v_ffc)
+                            </>
+                          )}
                         </div>
                       </div>
                       {monthEvents.length > 0 && (
@@ -725,8 +945,12 @@ function SimulatorPageInner() {
                         </div>
                       )}
                       <div style={{ color: 'var(--text-muted)', fontSize: 11 }}>
-                        ending FYC {fmtUSD(s.fyc)} (${s.fycPrice.toFixed(4)}/token, {Math.round(s.fycSupply).toLocaleString()} tokens) ·
-                        FFC {fmtUSD(s.ffc)} (${s.ffcPrice.toFixed(4)}/token, {Math.round(s.ffcSupply).toLocaleString()} tokens)
+                        ending FYC {fmtUSD(s.fyc)} (redeem ${s.fycPrice.toFixed(4)} / mint ${s.fycOptimisticPrice.toFixed(4)},{' '}
+                        {Math.round(s.fycSupply).toLocaleString()} tokens) ·
+                        FFC {fmtUSD(s.ffc)} (redeem ${s.ffcPrice.toFixed(4)} / mint ${s.ffcOptimisticPrice.toFixed(4)},{' '}
+                        {Math.round(s.ffcSupply).toLocaleString()} tokens)
+                        <br />
+                        ending reserve {fmtUSD(s.reserve)} · loans outstanding {fmtUSD(s.outstanding)}
                       </div>
                     </div>
                   )}
@@ -739,7 +963,7 @@ function SimulatorPageInner() {
 
       <div style={{ marginTop: 16 }}>
         <Callout>
-          Cumulative yield through period {cursor}: FYC <b style={{ color: 'var(--fyc)' }}>{fmtUSD(step.fycCumYield)}</b>, FFC{' '}
+          Cumulative yield through period {safeCursor}: FYC <b style={{ color: 'var(--fyc)' }}>{fmtUSD(step.fycCumYield)}</b>, FFC{' '}
           <b style={{ color: 'var(--ffc)' }}>{fmtUSD(step.ffcCumYield)}</b>.
         </Callout>
       </div>
