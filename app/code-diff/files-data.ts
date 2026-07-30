@@ -1,16 +1,27 @@
 export interface DiffFile {
   path: string;
   status: 'M' | 'U';
+  /** Which part of the monorepo this file lives in — drives the /code-diff
+   * category toggle. Every file up to this round's redemption/liquidity
+   * additions is 'pinocchio' (the on-chain program); backend/frontend
+   * entries were added for the redemption-liquidity design round. */
+  category: 'frontend' | 'backend' | 'pinocchio';
   why: string;
   original: string;
   proposed: string;
+  /** Authored, open follow-ups specific to this file — distinct from `why`
+   * (explains what the diff already does) and from the derived, read-only
+   * per-line notes (extractLineNotes, regenerated from source comments).
+   * Optional: most files have none. */
+  suggestions?: string[];
 }
 
 export const FILES: DiffFile[] = [
 {
   path: "pinochio/src/constants.rs",
   status: "M",
-  why: "Adds the six severity-curve constants (K_MIN, SEVERITY_REF, COVERAGE_WEIGHT_FLOOR, SEVERITY_MINT_FLOOR, SEVERITY_GATE_MAX, K_BREAKPOINTS) that back the new curve. FFC_COVERAGE_NUMERATOR/DENOMINATOR — the old flat 80% floor — are removed; only coverage.rs referenced them, so nothing else breaks. Also adds ALLOWED_SWAP_PROGRAMS (Jupiter + Titan, for helpers/jupiter.rs) and the yield-source seed/tag (for the new multi-yield-token mechanism — see state.rs).",
+  category: "pinocchio",
+  why: "Adds the six severity-curve constants (K_MIN, SEVERITY_REF, COVERAGE_WEIGHT_FLOOR, SEVERITY_MINT_FLOOR, SEVERITY_GATE_MAX, K_BREAKPOINTS) that back the new curve. FFC_COVERAGE_NUMERATOR/DENOMINATOR — the old flat 80% floor — are removed; only coverage.rs referenced them, so nothing else breaks. Also adds ALLOWED_SWAP_PROGRAMS (Jupiter + Titan, for helpers/jupiter.rs) and the yield-source seed/tag (for the new multi-yield-token mechanism — see state.rs). Round 2 (redemption/liquidity): adds the instant-redemption fee-scale bounds per tranche, the yield target range, and the earmark expiry window — see helpers/liquidity.rs and /redemption on the design tool.",
   original: `//! Protocol constants (mirrors \`program/programs/fleet-finance/src/constants.rs\`).
 
 use pinocchio::Address;
@@ -186,6 +197,7 @@ pub const TRANCHE_SEED: &[u8] = b"tranche";
 pub const LOAN_SEED: &[u8] = b"loan";
 pub const REDEEM_SEED: &[u8] = b"redeem";
 pub const ESCROW_SEED: &[u8] = b"escrow";
+pub const EARMARK_SEED: &[u8] = b"earmark"; // NEW (round 2) — see state.rs::EarmarkRecord
 
 // Account-data type tags (1 byte at offset 0 of each program-owned account).
 // Replaces Anchor's 8-byte sha256 discriminator.
@@ -195,6 +207,7 @@ pub const TAG_TRANCHE: u8 = 3;
 pub const TAG_LOAN: u8 = 4;
 pub const TAG_REDEMPTION: u8 = 5;
 pub const TAG_YIELD_SOURCE: u8 = 6;
+pub const TAG_EARMARK: u8 = 7; // NEW (round 2)
 
 // Pyth \`PriceUpdateV2\` account discriminator (Anchor sha256("account:PriceUpdateV2")[..8]).
 pub const PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
@@ -225,12 +238,43 @@ pub const MAX_HARMONIZED_SOURCES: usize = 8;
 pub const TITAN_PROGRAM_ID: Address =
     Address::new_from_array(pinocchio_pubkey::from_str("11111111111111111111111111111111"));
 
-pub const ALLOWED_SWAP_PROGRAMS: [Address; 2] = [JUPITER_V6_PROGRAM_ID, TITAN_PROGRAM_ID];`
+pub const ALLOWED_SWAP_PROGRAMS: [Address; 2] = [JUPITER_V6_PROGRAM_ID, TITAN_PROGRAM_ID];
+
+// --- Redemption liquidity & tranche conversion (round 2) — see
+// helpers/liquidity.rs, helpers/tranche_convert.rs, /redemption. ---
+
+/// Instant (accelerated) redemption fee band, in bps, per tranche —
+/// [fee_min, fee_max]. FFC sits strictly above FYC: junior liquidity is
+/// scarcer and riskier to hand out on demand. Admin-tunable within
+/// [0, MAX_INSTANT_FEE_BPS] via set_redemption_fees (extended this round).
+pub const INSTANT_FEE_BPS_FYC: (u64, u64) = (10, 50);   // 0.10% – 0.50%
+pub const INSTANT_FEE_BPS_FFC: (u64, u64) = (50, 100);  // 0.50% – 1.00%
+pub const MAX_INSTANT_FEE_BPS: u64 = 200;
+
+/// Multi-yield-source target band, in bps of annualized yield — see
+/// helpers/liquidity.rs::pick_rebalance_target. MIN is a soft reference, not
+/// a hard requirement: routing never errors just because it's unreachable.
+pub const YIELD_TARGET_MIN_BPS: u64 = 300;   // 3.00%
+pub const YIELD_TARGET_BPS: u64 = 350;       // 3.50%
+pub const YIELD_TARGET_MAX_BPS: u64 = 700;   // 7.00%
+
+/// How long an equity-received earmark reserves capital before a
+/// permissionless sweep can release it — guards against a forgotten
+/// cancel_earmark permanently over-reserving liquidity. Deliberately longer
+/// than FFC's own redemption lock (90d) so a slow-moving loan disbursement
+/// is never the reason a legitimate earmark expires early.
+pub const EARMARK_EXPIRY_SECS: i64 = 120 * SECONDS_PER_DAY;
+
+/// 365-day year — matches observed_source_apy_bps's own annualization
+/// factor (not a flat ×12 over 30-day periods). Used by run_yield_epoch.rs
+/// to derive each YieldSourceState's observed_apy_bps.
+pub const SECONDS_PER_YEAR: i64 = 365 * SECONDS_PER_DAY;`
 },
 {
   path: "pinochio/src/errors.rs",
   status: "M",
-  why: "Appends three new variants — two for the severity gates, one for the multi-yield-source registry. Appended, not inserted — every existing discriminant keeps its exact numeric value, since those are already-deployed error codes a live client may match on.",
+  category: "pinocchio",
+  why: "Appends three new variants — two for the severity gates, one for the multi-yield-source registry. Appended, not inserted — every existing discriminant keeps its exact numeric value, since those are already-deployed error codes a live client may match on. Round 2 appends five more — instant-redemption liquidity, the origination liquidity gate, the tranche-conversion re-checks, and earmark lifecycle — same append-only discipline.",
   original: `//! Program errors (mirrors Anchor \`FleetError\`). Mapped to \`ProgramError::Custom(u32)\`.
 
 use pinocchio::error::ProgramError;
@@ -356,6 +400,23 @@ pub enum FleetError {
     /// NEW — run_yield_epoch called against a YieldSourceState that's been
     /// paused/retired (is_active == 0).
     YieldSourceInactive = 40,
+    /// NEW (round 2) — instant (accelerated) redemption requested for more
+    /// than that tranche's currently available ELB share; must use the
+    /// scheduled 30d/90d queue instead.
+    InsufficientInstantLiquidity = 41,
+    /// NEW (round 2) — assert_liquidity_available_for_origination: new loan
+    /// would draw on capital already needed for submitted redemptions or
+    /// undisbursed earmarks.
+    InsufficientLiquidityForOrigination = 42,
+    /// NEW (round 2) — jr_to_sr would push severity, against the EXISTING
+    /// loan book, above SEVERITY_GATE_MAX_BPS.
+    ConversionWouldExceedSeverityGate = 43,
+    /// NEW (round 2) — sr_to_jr would violate assert_mint_allowed on the
+    /// resulting pool (same floor as an external FFC deposit).
+    ConversionBelowMintFloor = 44,
+    /// NEW (round 2) — cancel_earmark called by a non-admin before
+    /// expires_ts; only a permissionless sweep after expiry is allowed.
+    EarmarkNotYetExpired = 45,
 }
 
 impl From<FleetError> for ProgramError {
@@ -385,7 +446,12 @@ macro_rules! require_keys_eq {
 {
   path: "pinochio/src/state.rs",
   status: "M",
-  why: "LoanAccount gets one new field — levelized_interest, the flat per-period figure computed once at origination. This grows the repr(C) struct by 8 bytes, so LOAN_SPACE changes and any already-deployed LoanAccount PDAs need a migration (realloc + backfill) before this ships — flagged directly in /open-questions on the design tool. PoolState gets one new byte, yield_source_count, carved out of what was _padding — the struct's total size is unchanged, so this one is NOT a breaking change (existing accounts already read that byte as zero, which is the correct starting count). PoolState ALSO gets three new fields — loan_accrual_rate/loan_accrual_checkpoint/loan_accrual_updated_ts, a reward-per-second accumulator that makes compute_optimistic_price's loan-interest estimate a real per-active-loan accrual instead of the old cap-based proxy (see helpers/allocation.rs) — this IS a breaking 24-byte growth, same realloc + backfill migration story as LoanAccount's field, not folded into the free-padding trick above. New: YieldSourceState, one PDA per registered yield-bearing reserve token — see helpers/allocation.rs and instructions/initialize_yield_source.rs. (Its impl_account_io! registration and the RedemptionRequest struct/load-save-helpers tail of the real file are outside this excerpt — same as they were before this round.)",
+  category: "pinocchio",
+  why: "LoanAccount gets one new field — levelized_interest, the flat per-period figure computed once at origination. This grows the repr(C) struct by 8 bytes, so LOAN_SPACE changes and any already-deployed LoanAccount PDAs need a migration (realloc + backfill) before this ships — flagged directly in /open-questions on the design tool. PoolState gets one new byte, yield_source_count, carved out of what was _padding — the struct's total size is unchanged, so this one is NOT a breaking change (existing accounts already read that byte as zero, which is the correct starting count). PoolState ALSO gets three new fields — loan_accrual_rate/loan_accrual_checkpoint/loan_accrual_updated_ts, a reward-per-second accumulator that makes compute_optimistic_price's loan-interest estimate a real per-active-loan accrual instead of the old cap-based proxy (see helpers/allocation.rs) — this IS a breaking 24-byte growth, same realloc + backfill migration story as LoanAccount's field, not folded into the free-padding trick above. New: YieldSourceState, one PDA per registered yield-bearing reserve token — see helpers/allocation.rs and instructions/initialize_yield_source.rs. (Its impl_account_io! registration and the RedemptionRequest struct/load-save-helpers tail of the real file are outside this excerpt — same as they were before this round.) Round 2 (redemption/liquidity): PoolState gains pending_fyc_redemptions and earmarked_loan_capital (both breaking, same realloc+backfill story); YieldSourceState gains observed_apy_bps (not breaking — nothing is deployed against its layout yet) and repurposes is_active as the disable-source flag; new EarmarkRecord PDA carries each individual earmark's own expiry so a forgotten cancel_earmark can't permanently over-reserve capital.",
+  suggestions: [
+    "Two concurrent equity-received events can each pass the origination liquidity gate before either one's earmark_loan_capital call actually lands, both drawing on the same slice of ELB — EARMARK_EXPIRY_SECS + sweep_expired_earmark bounds the damage but doesn't prevent it; the real fix is serializing equity-received processing in the backend, not something this PDA layout alone can guarantee.",
+    "loan_ref on EarmarkRecord is an opaque off-chain id supplied by the backend — nothing on-chain currently verifies it corresponds to a real application-pipeline loan. Low risk since only admin can call earmark_loan_capital, but worth a decision on whether that's sufficient.",
+  ],
   original: `//! Zero-copy account state.
 //!
 //! Each program-owned account uses a 1-byte tag at offset 0 (no Anchor
@@ -614,6 +680,20 @@ pub struct PoolState {
     pub outstanding_principal: u64,
     pub realized_losses: u64,
     pub pending_ffc_redemptions: u64,
+    /// NEW (round 2) — mirrors pending_ffc_redemptions for FYC. Before this,
+    /// submit_redemption only tracked the FFC side; a queued FYC redemption
+    /// was invisible to both the ELB liquidity split and the new
+    /// origination liquidity gate (helpers/coverage.rs). BREAKING — grows
+    /// PoolState, same realloc + backfill (= 0) story as loan_accrual_rate
+    /// below.
+    pub pending_fyc_redemptions: u64,
+    /// NEW (round 2) — capital reserved against loans that reached the
+    /// off-chain "equity received" pipeline stage but haven't originated
+    /// on-chain yet. Netted out of ELB (helpers/liquidity.rs::compute_elb)
+    /// so it can't be instantly redeemed out from under a committed loan.
+    /// The aggregate lives here; each individual earmark (with its own
+    /// expiry) is its own EarmarkRecord PDA — see below.
+    pub earmarked_loan_capital: u64,
 
     pub last_epoch_ts: i64,
     pub loan_counter: u64,
@@ -771,8 +851,49 @@ pub struct YieldSourceState {
     pub c_tokens: u64,
     pub last_price: u64,
     pub last_epoch_ts: i64,
+    /// NEW (round 2) — this source's own observed annualized yield, derived
+    /// by run_yield_epoch.rs the same price-delta method
+    /// observed_source_apy_bps already uses for the single primary reserve.
+    /// Feeds helpers/liquidity.rs::blended_apy and pick_rebalance_target.
+    /// Not a breaking change — YieldSourceState is proposed-only, nothing is
+    /// deployed against the old layout yet.
+    pub observed_apy_bps: u64,
 
+    /// is_active doubles as the round-2 "enabled" flag: disable_yield_source.rs
+    /// (admin-only) flips it to 0, at which point this source stops
+    /// receiving new deposits/rebalance routing and is prioritized for
+    /// unwinding on the next redemption that swaps yield-token → stable
+    /// (helpers/liquidity.rs::pick_unwind_source).
     pub is_active: u8,
+    pub bump: u8,
+    pub _pad: [u8; 6],
+}
+
+// ---------------------------------------------------------------------------
+// EarmarkRecord — one PDA per equity-received earmark (round 2). PoolState's
+// earmarked_loan_capital above is the aggregate; each record here is what
+// actually carries an individual expiry, so sweep_expired_earmark can release
+// one forgotten earmark without needing to touch any other loan's.
+// Seeds: [EARMARK_SEED, pool, loan_ref].
+// ---------------------------------------------------------------------------
+
+pub mod earmark_status {
+    pub const ACTIVE: u8 = 0;
+    pub const RELEASED: u8 = 1;   // loan actually originated — capital moved to outstanding_principal
+    pub const CANCELLED: u8 = 2;  // admin cancel_earmark, or permissionless sweep after expiry
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct EarmarkRecord {
+    pub pool: RawKey,
+    /// Off-chain loan/application id this earmark backs — opaque to the
+    /// program, just a correlation key the backend supplies.
+    pub loan_ref: u64,
+    pub amount: u64,
+    pub created_ts: i64,
+    pub expires_ts: i64,
+    pub status: u8,
     pub bump: u8,
     pub _pad: [u8; 6],
 }`
@@ -780,7 +901,8 @@ pub struct YieldSourceState {
 {
   path: "pinochio/src/helpers/amortization.rs",
   status: "M",
-  why: "Adds levelized_interest — the flat per-period figure. period_interest (true declining-balance) stays put: it's still correct for the borrower-facing schedule, it's just no longer what the pool collects against.",
+  category: "pinocchio",
+  why: "Adds levelized_interest — the flat per-period figure. period_interest (true declining-balance) stays put: it's still correct for the borrower-facing schedule, it's just no longer what the pool collects against. Round 2 (found during a math review of this round's own formulas, not introduced by it): both compute_monthly_payment and period_interest hardcode '/ 12', implicitly treating a 30-day period as 1/12 of a year (a 30/360 day-count) — while helpers/allocation.rs's observed_source_apy_bps already annualizes reserve yield against a real 365-day year (ACT/365). A stated 15% APR loan was actually costing ~15.21% once measured against a true year. Fixed by using the exact SECONDS_PER_PERIOD/SECONDS_PER_YEAR fraction instead of an assumed /12 — see /open-questions and /glossary#PERIODS_PER_YEAR for the full writeup, including why 30/360 wasn't 'wrong' so much as inconsistent with a choice already made elsewhere.",
   original: `//! Loan amortization (mirrors helpers/amortization.rs).
 
 use pinocchio::error::ProgramError;
@@ -813,18 +935,32 @@ pub fn period_interest(current_balance: u64, apr_bps: u64) -> Result<u64, Progra
     u64::try_from(interest).map_err(|_| FleetError::Overflow.into())
 }`,
   proposed: `//! Loan amortization (mirrors helpers/amortization.rs).
+//! ROUND 2: rate_per_period no longer assumes a period is 1/12 of a year
+//! (30/360) — it uses the exact SECONDS_PER_PERIOD/SECONDS_PER_YEAR fraction
+//! instead, matching the day-count observed_source_apy_bps already uses for
+//! reserve yield (ACT/365). See /open-questions for the full writeup.
 
 use pinocchio::error::ProgramError;
-use crate::constants::BPS_DENOMINATOR;
+use crate::constants::{BPS_DENOMINATOR, SECONDS_PER_PERIOD, SECONDS_PER_YEAR};
 use crate::errors::FleetError;
 use crate::helpers::math::fixed_pow;
 
 const PRICE_SCALE: u128 = 1_000_000_000;
 
+/// CHANGED (round 2) — rate_per_period used to divide by a flat 12
+/// (implicitly a 30/360 day-count: 12 periods of exactly 1/12 year each,
+/// i.e. 360 days, not 365). Now multiplies by the exact
+/// SECONDS_PER_PERIOD/SECONDS_PER_YEAR fraction instead — the same
+/// day-count observed_source_apy_bps already uses for reserve yield. A
+/// stated 15% APR loan was actually costing ~15.21% once measured against
+/// a real calendar year; this makes the stated rate the actual rate.
 pub fn compute_monthly_payment(principal: u64, apr_bps: u64, term_months: u16) -> Result<u64, ProgramError> {
     if term_months == 0 { return Err(FleetError::Overflow.into()); }
-    let rate_per_period = (apr_bps as u128).checked_mul(PRICE_SCALE).ok_or(ProgramError::from(FleetError::Overflow))?
-        / 12 / BPS_DENOMINATOR as u128;
+    let rate_per_period = (apr_bps as u128)
+        .checked_mul(PRICE_SCALE).ok_or(ProgramError::from(FleetError::Overflow))?
+        .checked_mul(SECONDS_PER_PERIOD as u128).ok_or(ProgramError::from(FleetError::Overflow))?
+        / SECONDS_PER_YEAR as u128
+        / BPS_DENOMINATOR as u128;
     if rate_per_period == 0 {
         return Ok(principal / term_months as u64);
     }
@@ -841,9 +977,17 @@ pub fn compute_monthly_payment(principal: u64, apr_bps: u64, term_months: u16) -
 /// True, declining-balance interest for one period. Still correct — kept for
 /// the borrower-facing amortization schedule. No longer used to compute what
 /// the pool actually collects/splits; see \`levelized_interest\` below.
+/// CHANGED (round 2) — same SECONDS_PER_PERIOD/SECONDS_PER_YEAR fix as
+/// compute_monthly_payment above, for the identical reason: this must stay
+/// consistent with the schedule monthly_payment produces, or the borrower's
+/// declining-balance schedule and the pool's own internal schedule quietly
+/// diverge on total interest over the loan's life.
 pub fn period_interest(current_balance: u64, apr_bps: u64) -> Result<u64, ProgramError> {
-    let interest = (current_balance as u128).checked_mul(apr_bps as u128).ok_or(ProgramError::from(FleetError::Overflow))?
-        / 12 / BPS_DENOMINATOR as u128;
+    let interest = (current_balance as u128)
+        .checked_mul(apr_bps as u128).ok_or(ProgramError::from(FleetError::Overflow))?
+        .checked_mul(SECONDS_PER_PERIOD as u128).ok_or(ProgramError::from(FleetError::Overflow))?
+        / SECONDS_PER_YEAR as u128
+        / BPS_DENOMINATOR as u128;
     u64::try_from(interest).map_err(|_| FleetError::Overflow.into())
 }
 
@@ -863,7 +1007,8 @@ pub fn levelized_interest(principal: u64, apr_bps: u64, term_months: u16) -> Res
 {
   path: "pinochio/src/helpers/coverage.rs",
   status: "M",
-  why: "assert_origination_allowed's flat 80% coverage floor becomes a severity gate — origination capacity now scales with FYC's actual size instead of assuming it's 1:1 with FFC. New: assert_mint_allowed, which didn't exist before this round at all.",
+  category: "pinocchio",
+  why: "assert_origination_allowed's flat 80% coverage floor becomes a severity gate — origination capacity now scales with FYC's actual size instead of assuming it's 1:1 with FFC. New: assert_mint_allowed, which didn't exist before this round at all. Round 2 adds a second, independent origination check — assert_liquidity_available_for_origination — so a new loan can't be funded out of capital already needed to cover submitted redemptions or earmarked-but-undisbursed loans; both it and the severity gate must pass, whichever is stricter binds.",
   original: `//! Loan-origination guardrails: FFC coverage, allocation ceiling,
 //! insurance-floor checks (mirrors helpers/coverage.rs).
 
@@ -909,6 +1054,7 @@ use crate::constants::{
     BPS_DENOMINATOR, LOAN_ALLOCATION_BPS, SEVERITY_GATE_MAX_BPS, SEVERITY_MINT_FLOOR_BPS,
 };
 use crate::errors::FleetError;
+use crate::helpers::liquidity::compute_elb;
 use crate::helpers::math::{checked_add_u64, mul_div_u64};
 use crate::helpers::pricing::usd_for_tokens;
 use crate::state::{PoolState, TrancheState};
@@ -962,11 +1108,37 @@ pub fn assert_mint_allowed(
     let severity = severity_bps(pool.outstanding_principal, effective_ffc, fyc.v_tranche)?;
     if severity <= SEVERITY_MINT_FLOOR_BPS { return Err(FleetError::MintFloorNotMet.into()); }
     Ok(())
+}
+
+/// NEW (round 2) — a new loan can't be funded out of capital that's needed
+/// to cover redemptions already submitted (queued, not yet eligible OR
+/// eligible-but-not-yet-processed) across BOTH tranches, or capital already
+/// earmarked against a different loan that hasn't originated yet.
+/// Independent of the severity gate above — both must pass; whichever is
+/// stricter binds. Call this from instructions/originate_loan.rs right
+/// alongside assert_origination_allowed.
+pub fn assert_liquidity_available_for_origination(
+    pool: &PoolState,
+    fyc: &TrancheState,
+    ffc: &TrancheState,
+    new_loan_amount: u64,
+) -> Result<(), ProgramError> {
+    let elb = compute_elb(pool, fyc, ffc)?;
+    let reserved = checked_add_u64(
+        checked_add_u64(pool.pending_fyc_redemptions, pool.pending_ffc_redemptions)?,
+        pool.earmarked_loan_capital,
+    )?;
+    let available = elb.total.saturating_sub(reserved);
+    if new_loan_amount > available {
+        return Err(FleetError::InsufficientLiquidityForOrigination.into());
+    }
+    Ok(())
 }`
 },
 {
   path: "pinochio/src/helpers/curve.rs",
   status: "U",
+  category: "pinocchio",
   why: "New file — didn't exist before this round. The coverage → k_base lookup and the k_from_coverage_and_severity blend live here, isolated from waterfall.rs so the curve itself can get property tests (monotonic k_base, k always >= K_MIN) independent of the yield-split plumbing.",
   original: "",
   proposed: `//! Coverage → premium-multiplier curve (new file — yield-distribution
@@ -1056,6 +1228,7 @@ mod tests {
 {
   path: "pinochio/src/helpers/waterfall.rs",
   status: "M",
+  category: "pinocchio",
   why: "distribute_loan_interest's fyc_target/residual split — the actual bug: FYC's rate can invert below its own reserve-only baseline once FFC is oversized relative to the epoch cap — is replaced with the severity-scaled curve from curve.rs. Signature drops base_yield_token_price/now_ts: coverage and severity are read directly off pool + tranche state, no epoch snapshot needed. apply_default_waterfall is also redesigned into a three-tier order: FFC absorbs the loss first, same as before; once FFC is exhausted the remainder now burns FYC tokens held in the insurance wallet (a real loss absorption — v_tranche and total_supply both drop by the burned amount) instead of the old version's post-hoc price smoothing; only once the insurance fund's own FYC is exhausted does the loss finally reduce general fyc.v_tranche. approve_default.rs needs no changes — it already discards apply_default_waterfall's return value.",
   original: `//! Yield distribution + default waterfall + price refresh + pause check
 //! (mirrors helpers/waterfall.rs).
@@ -1339,6 +1512,7 @@ pub fn ensure_not_paused(pool: &PoolState) -> Result<(), ProgramError> {
 {
   path: "pinochio/src/helpers/jupiter.rs",
   status: "M",
+  category: "pinocchio",
   why: "invoke_jupiter_swap hardcodes JUPITER_V6_PROGRAM_ID twice — once as the allow-check, once again as the literal CPI target — so Jupiter is the only program this file can ever call. Renamed invoke_aggregator_swap checks the caller-supplied program against the new ALLOWED_SWAP_PROGRAMS list (constants.rs) and invokes THAT account, not a hardcoded constant. That's what makes Titan (titan-exchange.gitbook.io) — or any future aggregator — an allow-list entry away instead of a rewrite of this file. Titan publishes an off-chain quote/routing API (no fixed on-chain program ID in their public docs), so ALLOWED_SWAP_PROGRAMS carries an explicitly-flagged placeholder until real integration access lands — see constants.rs.",
   original: `//! Jupiter V6 raw CPI builder. Stack-allocated metas (no heap).
 
@@ -1413,6 +1587,12 @@ use crate::errors::FleetError;
 
 pub const MAX_ROUTE_ACCOUNTS: usize = 48;
 
+// NEW — was invoke_jupiter_swap, hardcoded to a single JUPITER_V6_PROGRAM_ID
+// check. is_allowed_swap_program checks against the new ALLOWED_SWAP_PROGRAMS
+// list (constants.rs) instead, and the renamed invoke_aggregator_swap below
+// takes swap_program as a caller-supplied account rather than a fixed name —
+// together these two are the entire generalization from Jupiter-only to any
+// allow-listed aggregator.
 fn is_allowed_swap_program(program: &Address) -> bool {
     ALLOWED_SWAP_PROGRAMS.iter().any(|p| p == program)
 }
@@ -1464,6 +1644,7 @@ pub fn invoke_aggregator_swap(
 {
   path: "pinochio/src/helpers/swap.rs",
   status: "M",
+  category: "pinocchio",
   why: "Renamed to match jupiter.rs's invoke_aggregator_swap — swap_jupiter_with_snapshots/execute_jupiter_swap/execute_jupiter_swap_to_deposit become swap_via_aggregator_with_snapshots/execute_aggregator_swap/execute_aggregator_swap_to_deposit, and every jupiter_program/base_yield_token_* name drops the aggregator- and token-specific naming (swap_program, yield_token_*) since deposit.rs, originate_loan.rs and repay_loan.rs now call through this file for either Jupiter or Titan, against whichever yield-bearing reserve token the pool is routing through.",
   original: `//! Generic Jupiter V6 swap with pre/post snapshots on source + dest vaults.
 
@@ -1571,6 +1752,10 @@ use crate::helpers::jupiter::invoke_aggregator_swap;
 use crate::helpers::math::mul_div_u64;
 use crate::helpers::token_account::token_account_amount;
 
+// CHANGED — was swap_jupiter_with_snapshots, hardcoded to Jupiter by name
+// only (the actual CPI is already generic via invoke_aggregator_swap below).
+// Renamed to match: this snapshots before/after balances around whichever
+// allow-listed aggregator swap_program names, Jupiter or Titan alike.
 pub fn swap_via_aggregator_with_snapshots(
     swap_program: &AccountView,
     source_vault: &AccountView,
@@ -1659,6 +1844,7 @@ pub fn execute_aggregator_swap_to_deposit(
 {
   path: "pinochio/src/helpers/allocation.rs",
   status: "M",
+  category: "pinocchio",
   why: "observed_source_apy_bps generalizes observed_base_yield_token_apy_bps to any registered YieldSourceState; new harmonized_reserve_apy_bps value-weights every source's APY into one blended figure. compute_optimistic_price is substantially rewritten, not re-parameterized — auditing it against the design intent (mint assuming not-yet-collected yield already accrued, from BOTH loan interest and yield-token appreciation) found the real contract got both wrong: loan side used a cap-based days-elapsed/30 proxy unrelated to any real loan's schedule; yield-token side wasn't reflected in optimistic pricing AT ALL, so minting right after a price move but before the next epoch tick priced new tokens off stale value, at existing holders' expense. Fixed: loan side now reads a real reward-per-second accrual off PoolState's three new fields (state.rs), split through the same severity curve real collection uses; yield-token side computes the live unrealized delta on source_c_tokens, split the same flat pro-rata way split_base_yield_token_yield does. Both read distribute_loan_interest's InterestDistribution.fyc_share/ffc_share directly rather than diffing v_tranche, so mint_fee_value_into_fyc's price-neutral fee mint is never double-counted. Flagged: compute_v_pool (pricing.rs) still only sums the primary reserve, so this function's own split denominator under-counts non-primary sources too — same tracked follow-up as elsewhere. Also drops deposit_value — a per-token price shouldn't depend on any one depositor's amount.",
   original: `//! Allocation snapshot + optimistic deposit price.
 
@@ -1927,6 +2113,7 @@ pub fn compute_optimistic_price(
 {
   path: "pinochio/src/instructions/deposit.rs",
   status: "M",
+  category: "pinocchio",
   why: "jupiter_program (account 12) becomes swap_program, checked against ALLOWED_SWAP_PROGRAMS instead of only Jupiter — an investor's route_data can now come from either aggregator's off-chain quote, forwarded to whichever program they name. execute_jupiter_swap becomes execute_aggregator_swap. compute_optimistic_price's call site is also updated for that function's own real rewrite (see helpers/allocation.rs why) — now passes both fyc_st/ffc_st plus target_is_fyc (the severity-curve loan-interest preview needs both tranches, not just the target) and p.c_tokens as this path's source token count, and no longer passes min_base_usd at all (a per-token price shouldn't depend on this depositor's amount). The direct-collateral path — depositing USDY/syrupUSDC straight in, skipping the swap entirely — is a new sibling instruction, instructions/deposit_yield_token.rs, not a branch inside this file.",
   original: `//! Investor deposit: USDC → swap to USYC → mint tranche tokens at optimistic price.
 //!
@@ -2317,6 +2504,7 @@ pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 {
   path: "pinochio/src/instructions/originate_loan.rs",
   status: "M",
+  category: "pinocchio",
   why: "Computes levelized_interest at origination time (same moment monthly_payment is already computed) and stores it on the new LoanAccount field, so repay_loan.rs never has to recompute it. jupiter_program (account 10) also becomes swap_program: execute_jupiter_swap_to_deposit becomes execute_aggregator_swap_to_deposit, callable with either allow-listed aggregator. Also adds this loan to pool.loan_accrual_rate — the reward-per-second accumulator compute_optimistic_price reads (helpers/allocation.rs) to give optimistic pricing a real per-active-loan accrual estimate instead of the old cap-based proxy. See state.rs for the three new PoolState fields and instructions/repay_loan.rs / flag_pending_default.rs for the other two places that keep the rate current.",
   original: `//! Originate a loan: swap USYC→USDC, transfer principal to borrower, write loan PDA.
 //!
@@ -2674,6 +2862,7 @@ pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 {
   path: "pinochio/src/instructions/repay_loan.rs",
   status: "M",
+  category: "pinocchio",
   why: "Reads l.levelized_interest instead of calling period_interest — the core behavior change. Every downstream line (principal_portion, total_payment, balance paydown) is untouched; only the interest figure's source changes, from live declining-balance to the flat figure stored at origination. jupiter_program (account 9) also becomes swap_program: execute_jupiter_swap becomes execute_aggregator_swap, callable with either allow-listed aggregator. Also keeps pool.loan_accrual_checkpoint/rate current: this payment's `interest` comes out of the checkpoint (it's realized now, not still-accruing), and if this was the loan's last payment its rate contribution is removed entirely — the other two of the three places that keep compute_optimistic_price's real accrual estimate correct (helpers/allocation.rs), alongside originate_loan.rs and flag_pending_default.rs.",
   original: `//! Borrower repays a monthly installment; interest is split FYC/FFC and fee minted.
 //!
@@ -2955,6 +3144,7 @@ pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 {
   path: "pinochio/src/instructions/flag_pending_default.rs",
   status: "M",
+  category: "pinocchio",
   why: "The third and last of the three places that keep pool.loan_accrual_rate/checkpoint correct for compute_optimistic_price (helpers/allocation.rs — see state.rs for the fields, originate_loan.rs and repay_loan.rs for the other two). Deliberately stops counting a loan's assumed accrual HERE, not at the later approve_default.rs — by the time a loan is flagged pending-default it's already gone through a full CURE_PERIOD_DAYS of non-payment, so continuing to assume its interest is still accruing all the way until a separate admin action formally defaults it would keep inflating optimistic price with money already known to be at risk, for however long that gap happens to be. load_pool becomes load_pool_mut / a new save_pool call — the only other change; the actual default-flagging logic (delinquency check, cure-period check) is untouched.",
   original: `//! Flag a delinquent loan as PendingDefault after the cure period elapses.
 //! Accounts: [admin, pool, loan]
@@ -3050,7 +3240,8 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
 {
   path: "pinochio/src/instructions/run_yield_epoch.rs",
   status: "M",
-  why: "Backward compatible, not a breaking rewrite: called with the original 5 accounts, this ticks the pool's primary reserve exactly as before, byte-for-byte the same math, still writing PoolState's own c_tokens/last_base_yield_token_price/last_epoch_ts — every existing off-chain caller keeps working unmodified. Called with 6 accounts — a yield_source account inserted before the oracle — it ticks THAT registered YieldSourceState (USDY, syrupUSDC, ...) instead, using the same observed_source_apy_bps-style 24h-epoch math from helpers/allocation.rs, without ever touching PoolState. Adding a source's epoch tick is a longer accounts array, not a new instruction or a new tag. v_pool for the fee/split math still only sums the primary reserve either way — the same tracked helpers/pricing.rs follow-up noted on helpers/allocation.rs — so this file doesn't silently claim more coverage than it has.",
+  category: "pinocchio",
+  why: "Backward compatible, not a breaking rewrite: called with the original 5 accounts, this ticks the pool's primary reserve exactly as before, byte-for-byte the same math, still writing PoolState's own c_tokens/last_base_yield_token_price/last_epoch_ts — every existing off-chain caller keeps working unmodified. Called with 6 accounts — a yield_source account inserted before the oracle — it ticks THAT registered YieldSourceState (USDY, syrupUSDC, ...) instead, using the same observed_source_apy_bps-style 24h-epoch math from helpers/allocation.rs, without ever touching PoolState. Adding a source's epoch tick is a longer accounts array, not a new instruction or a new tag. v_pool for the fee/split math still only sums the primary reserve either way — the same tracked helpers/pricing.rs follow-up noted on helpers/allocation.rs — so this file doesn't silently claim more coverage than it has. Round 2: the 6-account branch now also writes the derived rate into YieldSourceState.observed_apy_bps, feeding helpers/liquidity.rs::blended_apy — WHICH source new capital should route into (the [3%, 3.5%, 7%] target-range logic) is deliberately kept an off-chain preview computation, not folded into this instruction; this instruction only ever ticks the one source it's given.",
   original: `//! Distribute newly-accrued base-yield-token yield (epoch tick).
 //! Accounts: [authority, pool, fyc, ffc, base_yield_token_oracle]
 //! Data: ()
@@ -3120,7 +3311,7 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
 
 use pinocchio::{account::AccountView, cpi::Seed, sysvars::{clock::Clock, Sysvar}, ProgramResult};
 
-use crate::constants::{BPS_DENOMINATOR, NET_YIELD_BPS, PRECISION};
+use crate::constants::{BPS_DENOMINATOR, NET_YIELD_BPS, PRECISION, SECONDS_PER_YEAR};
 use crate::errors::FleetError;
 use crate::helpers::fees::mint_fee_value_into_fyc;
 use crate::helpers::math::mul_div_u64;
@@ -3166,6 +3357,15 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
         // as a follow-up in helpers/pricing.rs, not silently absorbed here.
         let v_pool = compute_v_pool(&p, p.last_base_yield_token_price)?;
 
+        // NEW (round 2) — annualize this epoch's rate into observed_apy_bps,
+        // the same 365-day-year method observed_source_apy_bps already uses;
+        // helpers/liquidity.rs::blended_apy reads this across every source.
+        let elapsed = (now_ts - ys.last_epoch_ts).max(1);
+        ys.observed_apy_bps = mul_div_u64(
+            mul_div_u64(price_delta, BPS_DENOMINATOR, ys.last_price.max(1))?,
+            SECONDS_PER_YEAR as u64,
+            elapsed as u64,
+        )?;
         ys.last_price = price_now;
         ys.last_epoch_ts = now_ts;
         save_yield_source(yield_source, &ys)?;
@@ -3205,7 +3405,8 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
 {
   path: "pinochio/src/instructions/initialize_yield_source.rs",
   status: "U",
-  why: "New instruction (ix_tag::INITIALIZE_YIELD_SOURCE, tag 16). Registers one more YieldSourceState PDA for a yield-bearing reserve token (USDY, syrupUSDC, ...) — the mechanism the user asked for to support more than one yield-bearing token without a breaking change. Structurally mirrors initialize_tranche.rs: verify_pda + create_pda_account + a fresh zero-copy struct write, admin-gated the same way originate_loan.rs gates itself (p.assert_admin). Never touches PoolState's layout — only increments its new yield_source_count byte.",
+  category: "pinocchio",
+  why: "New instruction (ix_tag::INITIALIZE_YIELD_SOURCE, tag 16). Registers one more YieldSourceState PDA for a yield-bearing reserve token (USDY, syrupUSDC, ...) — the mechanism the user asked for to support more than one yield-bearing token without a breaking change. Structurally mirrors initialize_tranche.rs: verify_pda + create_pda_account + a fresh zero-copy struct write, admin-gated the same way originate_loan.rs gates itself (p.assert_admin). Never touches PoolState's layout — only increments its new yield_source_count byte. Already satisfies 'only an admin can add a yield-bearing collateral token' — confirmed p.assert_admin gates this in round 1, unchanged this round. Round 2 just zero-initializes the new observed_apy_bps field alongside the others.",
   original: "",
   proposed: `//! Register a new yield-bearing reserve token (USDY, syrupUSDC, ...) as an
 //! additional YieldSourceState PDA. Adding a source never touches PoolState's
@@ -3269,6 +3470,7 @@ pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
         c_tokens: 0,
         last_price: 0,
         last_epoch_ts: 0,
+        observed_apy_bps: 0, // NEW (round 2) — first run_yield_epoch tick populates it
         is_active: 1,
         bump: yield_source_bump,
         _pad: [0u8; 6],
@@ -3286,6 +3488,7 @@ pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 {
   path: "pinochio/src/instructions/deposit_yield_token.rs",
   status: "U",
+  category: "pinocchio",
   why: "New instruction (ix_tag::DEPOSIT_YIELD_TOKEN, tag 17) — the direct-collateral deposit path the user asked for: 'we won't need to swap via titan or jupiter, we just deposit them straight into our pool.' Same mint-at-optimistic-price math as instructions/deposit.rs, minus the swap leg entirely — the investor's own yield-bearing tokens go straight into that source's vault. Prices off the target YieldSourceState's own c_tokens/last_price (compute_optimistic_price's real signature — see helpers/allocation.rs), not the pool's primary reserve, so this is correct even for a second or third registered source — both the yield-token accrual and the loan-interest accrual (shared pool-wide, same for every source) price correctly here.",
   original: "",
   proposed: `//! Investor deposit: yield-bearing token (USDY, syrupUSDC, ...) straight into
@@ -3428,6 +3631,7 @@ pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 {
   path: "pinochio/src/instructions/burn_insurance_for_ffc.rs",
   status: "U",
+  category: "pinocchio",
   why: "New instruction (ix_tag::BURN_INSURANCE_FOR_FFC, tag 18) — the manual function the user asked for: 'a function that we can call to help cover some FFC losses even when the loss did not hit insurance fund... we input how much FYC we want to burn... it will increase the price of FFC.' Admin-gated, input is fyc_burn_amount (tokens, not USD). Burns that many FYC tokens out of the insurance wallet's own holdings — fyc.v_tranche and fyc.total_supply both drop, same real-burn shape as the insurance tier of the redesigned apply_default_waterfall (helpers/waterfall.rs) — and moves the USD value they were worth straight into ffc.v_tranche. FFC's total_supply is untouched, so that value increase lands entirely in FFC's price, not as new tokens.",
   original: "",
   proposed: `//! Manual admin action: burn some of the insurance wallet's own FYC holdings
@@ -3501,6 +3705,7 @@ pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 {
   path: "pinochio/src/lib.rs",
   status: "M",
+  category: "pinocchio",
   why: "Three new ix_tag discriminators and dispatch arms for the multi-yield-source + direct-deposit + manual-insurance-burn instructions. Appended after ACCELERATED_REDEEM (15), not inserted, so every existing tag a live client already encodes against keeps its exact numeric value.",
   original: `//! Fleet Finance — Pinocchio-native port of the Anchor program.
 
@@ -3680,7 +3885,8 @@ pub fn process_instruction(
 {
   path: "pinochio/src/instructions/mod.rs",
   status: "M",
-  why: "Registers the three new instruction modules — initialize_yield_source, deposit_yield_token, burn_insurance_for_ffc — alphabetically, matching this file's existing convention.",
+  category: "pinocchio",
+  why: "Registers the three new instruction modules — initialize_yield_source, deposit_yield_token, burn_insurance_for_ffc — alphabetically, matching this file's existing convention. Round 2 registers five more: jr_to_sr, sr_to_jr, disable_yield_source, earmark_loan_capital, cancel_earmark.",
   original: `pub mod accelerated_redeem;
 pub mod approve_default;
 pub mod deposit;
@@ -3701,13 +3907,17 @@ pub mod submit_redemption;
   proposed: `pub mod accelerated_redeem;
 pub mod approve_default;
 pub mod burn_insurance_for_ffc;
+pub mod cancel_earmark;
 pub mod deposit;
 pub mod deposit_yield_token;
+pub mod disable_yield_source;
+pub mod earmark_loan_capital;
 pub mod flag_pending_default;
 pub mod initialize_contract;
 pub mod initialize_pool;
 pub mod initialize_tranche;
 pub mod initialize_yield_source;
+pub mod jr_to_sr;
 pub mod originate_loan;
 pub mod process_redemption;
 pub mod recalculate_allocation;
@@ -3716,13 +3926,15 @@ pub mod repay_loan;
 pub mod run_yield_epoch;
 pub mod set_paused;
 pub mod set_redemption_fees;
+pub mod sr_to_jr;
 pub mod submit_redemption;
 `
 },
 {
   path: "pinochio/src/helpers/mod.rs",
   status: "M",
-  why: "Registers the new curve module so helpers::curve::* resolves.",
+  category: "pinocchio",
+  why: "Registers the new curve module so helpers::curve::* resolves. Round 2 registers liquidity (ELB, instant-fee scale, yield-target routing) and tranche_convert (jr_to_sr/sr_to_jr shared logic).",
   original: `pub mod allocation;
 pub mod amortization;
 pub mod coverage;
@@ -3743,6 +3955,7 @@ pub mod coverage;
 pub mod curve;
 pub mod fees;
 pub mod jupiter;
+pub mod liquidity;
 pub mod math;
 pub mod metaplex;
 pub mod oracle;
@@ -3751,6 +3964,1594 @@ pub mod redemption;
 pub mod swap;
 pub mod sysprog;
 pub mod token_account;
+pub mod tranche_convert;
 pub mod waterfall;`
+},
+{
+  path: "pinochio/src/helpers/liquidity.rs",
+  status: "U",
+  category: "pinocchio",
+  why: "New file (round 2) — ELB (excess liquidity balance), the instant-redemption fee scale, and multi-yield-source blended-yield routing. Split into its own module rather than folded into coverage.rs, same reasoning /implementation gives for curve.rs: keeps this math independently property-testable. Follows the struct/pure-inner pattern from /implementation pattern 1 — pick_rebalance_target is explicitly #[cfg(feature = \"offchain\")], the same trust boundary Jupiter/Titan route selection already uses; the on-chain instructions here only ever receive an already-chosen source id.",
+  original: "",
+  proposed: `//! Redemption liquidity — ELB (excess liquidity balance), the instant-
+//! redemption fee scale, and multi-yield-source blended-yield routing.
+//! New this round — see /redemption, /tranche-swap, /yield-sources.
+
+use pinocchio::error::ProgramError;
+
+use crate::constants::{
+    BPS_DENOMINATOR, INSTANT_FEE_BPS_FFC, INSTANT_FEE_BPS_FYC, TRANCHE_FFC,
+    YIELD_TARGET_BPS, YIELD_TARGET_MAX_BPS, YIELD_TARGET_MIN_BPS,
+};
+use crate::errors::FleetError;
+use crate::helpers::math::{checked_add_u64, mul_div_u64};
+use crate::state::{PoolState, TrancheState, YieldSourceState};
+
+pub struct Elb {
+    pub total: u64,
+    pub fyc: u64,
+    pub ffc: u64,
+}
+
+/// elb_total = (FYC + FFC) − outstanding − earmarked_loan_capital, split
+/// pro-rata by pool share — the same flat formula split_base_yield_token_yield
+/// already uses for reserve YIELD, applied here to reserve CAPITAL instead.
+pub fn compute_elb(pool: &PoolState, fyc: &TrancheState, ffc: &TrancheState) -> Result<Elb, ProgramError> {
+    let v_pool = checked_add_u64(fyc.v_tranche, ffc.v_tranche)?;
+    let reserved = checked_add_u64(pool.outstanding_principal, pool.earmarked_loan_capital)?;
+    let total = v_pool.saturating_sub(reserved);
+    if v_pool == 0 || total == 0 {
+        return Ok(Elb { total: 0, fyc: 0, ffc: 0 });
+    }
+    let elb_fyc = mul_div_u64(total, fyc.v_tranche, v_pool)?;
+    Ok(Elb { total, fyc: elb_fyc, ffc: total.saturating_sub(elb_fyc) })
+}
+
+pub struct InstantFee {
+    pub fee_bps: u64,
+    pub fee_value: u64,
+    pub net_payout: u64,
+}
+
+/// fee_bps = fee_min + (amount / elb_tranche) × (fee_max − fee_min), applied
+/// flat to the whole redemption — the ENDPOINT-RATE formula as specified.
+/// Split-gameable (splitting one redemption into several converges toward
+/// fee_min) — deliberately not hardened here; see /open-questions for the
+/// split-invariant integral variant this could become in production.
+/// Redeeming more than elb_tranche isn't discounted or partially served —
+/// it's simply ineligible for the instant path; the caller must fall back
+/// to submit_redemption's 30d/90d queue instead.
+pub fn instant_redemption_fee(tranche: u8, amount: u64, elb_tranche: u64) -> Result<InstantFee, ProgramError> {
+    instant_redemption_fee_inner(tranche, amount, elb_tranche)
+        .ok_or_else(|| FleetError::InsufficientInstantLiquidity.into())
+}
+
+fn instant_redemption_fee_inner(tranche: u8, amount: u64, elb_tranche: u64) -> Option<InstantFee> {
+    if amount == 0 || elb_tranche == 0 || amount > elb_tranche {
+        return None;
+    }
+    let (fee_min, fee_max) = if tranche == TRANCHE_FFC { INSTANT_FEE_BPS_FFC } else { INSTANT_FEE_BPS_FYC };
+    let fee_bps = fee_min + ((amount as u128 * (fee_max - fee_min) as u128) / elb_tranche as u128) as u64;
+    let fee_value = ((amount as u128 * fee_bps as u128) / BPS_DENOMINATOR as u128) as u64;
+    Some(InstantFee { fee_bps, fee_value, net_payout: amount.saturating_sub(fee_value) })
+}
+
+/// Capital-weighted blended APY across every ENABLED yield source —
+/// structurally identical to Hylo's published "Average SOL Reserve Yield"
+/// equation. A disabled (is_active == 0) source doesn't count toward the
+/// portfolio target at all — it's being wound down, not steered toward.
+pub fn blended_apy_bps(sources: &[YieldSourceState]) -> u64 {
+    let mut total_capital: u128 = 0;
+    let mut weighted: u128 = 0;
+    for s in sources.iter().filter(|s| s.is_active != 0) {
+        let capital = s.c_tokens as u128 * s.last_price as u128;
+        total_capital += capital;
+        weighted += capital * s.observed_apy_bps as u128;
+    }
+    if total_capital == 0 { return 0; }
+    (weighted / total_capital) as u64
+}
+
+/// Which ENABLED source new capital should route into: whichever lands the
+/// resulting blended APY closest to YIELD_TARGET_BPS among candidates inside
+/// [YIELD_TARGET_MIN_BPS, YIELD_TARGET_MAX_BPS]; if none land in range,
+/// whichever gets the HIGHEST resulting APY instead. Never errors just
+/// because the target is unreachable — that's exactly why the min exists.
+pub fn pick_rebalance_target(sources: &[YieldSourceState], deposit_amount: u64) -> Option<usize> {
+    let mut best_in_range: Option<(usize, u64)> = None;
+    let mut best_overall: Option<(usize, u64)> = None;
+    for (i, s) in sources.iter().enumerate() {
+        if s.is_active == 0 { continue; }
+        let mut hypothetical: Vec<YieldSourceState> = sources.to_vec();
+        hypothetical[i].c_tokens = hypothetical[i].c_tokens.saturating_add(deposit_amount);
+        let apy = blended_apy_bps(&hypothetical);
+        if apy >= YIELD_TARGET_MIN_BPS && apy <= YIELD_TARGET_MAX_BPS {
+            let dist = apy.abs_diff(YIELD_TARGET_BPS);
+            if best_in_range.map_or(true, |(_, d)| dist < d) {
+                best_in_range = Some((i, dist));
+            }
+        }
+        if best_overall.map_or(true, |(_, a)| apy > a) {
+            best_overall = Some((i, apy));
+        }
+    }
+    best_in_range.map(|(i, _)| i).or(best_overall.map(|(i, _)| i))
+}
+
+/// Redemption payout draws from a DISABLED source before touching any
+/// enabled one, so a retired token actually winds down over time instead of
+/// sitting inert once flagged. Tiebreak among multiple disabled sources:
+/// lowest observed_apy_bps first (unwind the least-productive one first).
+pub fn pick_unwind_source(sources: &[YieldSourceState]) -> Option<usize> {
+    sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_active == 0 && s.c_tokens > 0)
+        .min_by_key(|(_, s)| s.observed_apy_bps)
+        .map(|(i, _)| i)
+}`
+},
+{
+  path: "pinochio/src/helpers/tranche_convert.rs",
+  status: "U",
+  category: "pinocchio",
+  why: "New file (round 2) — jr_to_sr / sr_to_jr, the shared conversion primitive. Burns one tranche at ITS conservative price, mints the other at ITS conservative price, so V_pool is exactly unchanged. Used by the two thin instructions (jr_to_sr.rs / sr_to_jr.rs) AND internally by accelerated_redeem.rs's FFC-fee settlement — one audited primitive, not two hand-rolled burn/mint paths. See /tranche-swap.",
+  original: "",
+  proposed: `//! jr_to_sr / sr_to_jr — burn one tranche's tokens, mint the other's, both
+//! legs at CONSERVATIVE price, so V_pool is exactly unchanged. New this
+//! round — see /tranche-swap.
+
+use pinocchio::error::ProgramError;
+
+use crate::constants::{BPS_DENOMINATOR, PRECISION, SEVERITY_GATE_MAX_BPS};
+use crate::errors::FleetError;
+use crate::helpers::coverage::assert_mint_allowed;
+use crate::helpers::math::mul_div_u64;
+use crate::helpers::pricing::usd_for_tokens;
+use crate::state::{PoolState, TrancheState};
+
+pub struct ConversionResult {
+    pub value_usd: u64,
+    pub tokens_out: u64,
+}
+
+/// Burns \`tokens_in\` of FFC at its conservative price, mints the same USD
+/// value of FYC at ITS conservative price. Re-checks severity against the
+/// EXISTING loan book afterward — a conversion shrinks FFC's first-loss
+/// cover for loans that already exist, not just future originations.
+pub fn jr_to_sr(
+    pool: &PoolState,
+    fyc: &mut TrancheState,
+    ffc: &mut TrancheState,
+    tokens_in: u64,
+) -> Result<ConversionResult, ProgramError> {
+    let value_usd = usd_for_tokens(tokens_in, ffc.conservative_price)?;
+    let tokens_out = if fyc.conservative_price > 0 { mul_div_u64(value_usd, PRECISION, fyc.conservative_price)? } else { 0 };
+
+    ffc.v_tranche = ffc.v_tranche.saturating_sub(value_usd);
+    ffc.total_supply = ffc.total_supply.saturating_sub(tokens_in);
+    fyc.v_tranche = fyc.v_tranche.saturating_add(value_usd);
+    fyc.total_supply = fyc.total_supply.saturating_add(tokens_out);
+
+    if severity_bps_after(pool.outstanding_principal, ffc.v_tranche, fyc.v_tranche)? > SEVERITY_GATE_MAX_BPS {
+        return Err(FleetError::ConversionWouldExceedSeverityGate.into());
+    }
+    Ok(ConversionResult { value_usd, tokens_out })
+}
+
+/// Mirror image — burns FYC, mints FFC. Re-checked against assert_mint_allowed
+/// instead of the severity gate: this is "new" FFC supply from the pool's
+/// perspective, same floor as an external deposit.
+pub fn sr_to_jr(
+    pool: &PoolState,
+    fyc: &mut TrancheState,
+    ffc: &mut TrancheState,
+    tokens_in: u64,
+) -> Result<ConversionResult, ProgramError> {
+    let value_usd = usd_for_tokens(tokens_in, fyc.conservative_price)?;
+    let tokens_out = if ffc.conservative_price > 0 { mul_div_u64(value_usd, PRECISION, ffc.conservative_price)? } else { 0 };
+
+    fyc.v_tranche = fyc.v_tranche.saturating_sub(value_usd);
+    fyc.total_supply = fyc.total_supply.saturating_sub(tokens_in);
+    ffc.v_tranche = ffc.v_tranche.saturating_add(value_usd);
+    ffc.total_supply = ffc.total_supply.saturating_add(tokens_out);
+
+    assert_mint_allowed(pool, fyc, ffc).map_err(|_| ProgramError::from(FleetError::ConversionBelowMintFloor))?;
+    Ok(ConversionResult { value_usd, tokens_out })
+}
+
+fn severity_bps_after(outstanding: u64, ffc_v: u64, fyc_v: u64) -> Result<u64, ProgramError> {
+    if fyc_v == 0 { return Ok(0); }
+    let shortfall = outstanding.saturating_sub(ffc_v);
+    mul_div_u64(shortfall, BPS_DENOMINATOR, fyc_v)
+}`,
+  suggestions: [
+    "Neither jr_to_sr nor sr_to_jr re-checks the post-conversion ELB split against pending_fyc_redemptions/pending_ffc_redemptions — a conversion instantly reweights each tranche's share of ELB and can strand an already-queued redeemer in the shrinking tranche even though the severity/mint-floor check still passes. Add that check before shipping.",
+    "Whether jr_to_sr/sr_to_jr should be blocked from composing atomically with originate_loan in the same transaction (temporarily satisfying a gate, originating, then reversing) isn't decided — every check here reads live state so it's likely low-risk, but deserves an explicit answer. See /open-questions.",
+  ],
+},
+{
+  path: "pinochio/src/instructions/jr_to_sr.rs",
+  status: "U",
+  category: "pinocchio",
+  why: "New instruction (round 2) — investor-initiated tranche conversion, thin wrapper around helpers/tranche_convert.rs::jr_to_sr. Burns the investor's FFC up front, then mints FYC only if the post-conversion severity check inside the helper actually passes — so a rejected conversion never leaves the investor's FFC burned with nothing minted in return.",
+  original: "",
+  proposed: `//! jr_to_sr — investor-initiated tranche conversion: burn FFC, mint FYC at
+//! conservative price on both legs. New this round — see /tranche-swap.
+//!
+//! Accounts: [investor, pool, fyc_tranche, ffc_tranche, fyc_mint, ffc_mint,
+//!            investor_ffc_account, investor_fyc_account, token_program]
+//! Data: tokens_in (u64)
+
+use pinocchio::{account::AccountView, cpi::{Seed, Signer}, ProgramResult};
+use pinocchio_token::instructions::{Burn, MintTo};
+
+use crate::constants::POOL_SEED;
+use crate::errors::FleetError;
+use crate::helpers::tranche_convert::jr_to_sr as convert;
+use crate::helpers::waterfall::ensure_not_paused;
+use crate::pda::*;
+use crate::state::{load_pool_mut, load_tranche_mut, save_pool, save_tranche};
+
+pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [investor, pool, fyc_tranche, ffc_tranche, fyc_mint, ffc_mint,
+         investor_ffc_acc, investor_fyc_acc, _token_program, ..] =
+        accounts else { return Err(FleetError::InvalidAccountData.into()) };
+
+    let mut c = 0;
+    let tokens_in = read_u64(data, &mut c)?;
+
+    require_signer(investor)?;
+    let p = load_pool_mut(pool)?;
+    ensure_not_paused(&p)?;
+    if tokens_in == 0 { return Err(FleetError::Overflow.into()); }
+
+    let mut fyc = load_tranche_mut(fyc_tranche)?;
+    let mut ffc = load_tranche_mut(ffc_tranche)?;
+
+    // 1. Burn the investor's FFC up front — mint only happens once the
+    // post-conversion severity check inside convert() actually passes.
+    Burn::new(investor_ffc_acc, ffc_mint, investor, tokens_in).invoke()?;
+    let result = convert(&p, &mut fyc, &mut ffc, tokens_in)?;
+
+    // 2. Mint the investor's new FYC — pool PDA is the mint authority.
+    let auth_key = p.authority;
+    let pool_bump_arr = [p.bump];
+    let pool_seeds: [Seed; 3] = [Seed::from(POOL_SEED), Seed::from(&auth_key[..]), Seed::from(&pool_bump_arr[..])];
+    let pool_signer = [Signer::from(&pool_seeds[..])];
+    MintTo::new(fyc_mint, investor_fyc_acc, pool, result.tokens_out).invoke_signed(&pool_signer)?;
+
+    save_tranche(fyc_tranche, &fyc)?;
+    save_tranche(ffc_tranche, &ffc)?;
+    save_pool(pool, &p)?;
+    Ok(())
+}`
+},
+{
+  path: "pinochio/src/instructions/sr_to_jr.rs",
+  status: "U",
+  category: "pinocchio",
+  why: "New instruction (round 2) — mirror image of jr_to_sr.rs: burn FYC, mint FFC, gated on assert_mint_allowed instead of the severity gate. Same account shape and burn-before-mint ordering.",
+  original: "",
+  proposed: `//! sr_to_jr — investor-initiated tranche conversion: burn FYC, mint FFC at
+//! conservative price on both legs. New this round — see /tranche-swap.
+//!
+//! Accounts: [investor, pool, fyc_tranche, ffc_tranche, fyc_mint, ffc_mint,
+//!            investor_fyc_account, investor_ffc_account, token_program]
+//! Data: tokens_in (u64)
+
+use pinocchio::{account::AccountView, cpi::{Seed, Signer}, ProgramResult};
+use pinocchio_token::instructions::{Burn, MintTo};
+
+use crate::constants::POOL_SEED;
+use crate::errors::FleetError;
+use crate::helpers::tranche_convert::sr_to_jr as convert;
+use crate::helpers::waterfall::ensure_not_paused;
+use crate::pda::*;
+use crate::state::{load_pool_mut, load_tranche_mut, save_pool, save_tranche};
+
+pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [investor, pool, fyc_tranche, ffc_tranche, fyc_mint, ffc_mint,
+         investor_fyc_acc, investor_ffc_acc, _token_program, ..] =
+        accounts else { return Err(FleetError::InvalidAccountData.into()) };
+
+    let mut c = 0;
+    let tokens_in = read_u64(data, &mut c)?;
+
+    require_signer(investor)?;
+    let p = load_pool_mut(pool)?;
+    ensure_not_paused(&p)?;
+    if tokens_in == 0 { return Err(FleetError::Overflow.into()); }
+
+    let mut fyc = load_tranche_mut(fyc_tranche)?;
+    let mut ffc = load_tranche_mut(ffc_tranche)?;
+
+    Burn::new(investor_fyc_acc, fyc_mint, investor, tokens_in).invoke()?;
+    let result = convert(&p, &mut fyc, &mut ffc, tokens_in)?;
+
+    let auth_key = p.authority;
+    let pool_bump_arr = [p.bump];
+    let pool_seeds: [Seed; 3] = [Seed::from(POOL_SEED), Seed::from(&auth_key[..]), Seed::from(&pool_bump_arr[..])];
+    let pool_signer = [Signer::from(&pool_seeds[..])];
+    MintTo::new(ffc_mint, investor_ffc_acc, pool, result.tokens_out).invoke_signed(&pool_signer)?;
+
+    save_tranche(fyc_tranche, &fyc)?;
+    save_tranche(ffc_tranche, &ffc)?;
+    save_pool(pool, &p)?;
+    Ok(())
+}`
+},
+{
+  path: "pinochio/src/instructions/disable_yield_source.rs",
+  status: "U",
+  category: "pinocchio",
+  why: "New instruction (round 2) — admin-only, retires a registered yield source (the 'stop accepting a particular yield-bearing token' function the user asked for). Flips is_active to 0; helpers/liquidity.rs::pick_unwind_source then prioritizes it on the next redemption payout, and pick_rebalance_target stops routing new capital to it. No PoolState changes.",
+  original: "",
+  proposed: `//! Admin-only: retire a registered yield source. Once disabled, it stops
+//! receiving new deposits/rebalance routing (helpers/liquidity.rs) and is
+//! prioritized for unwinding on the next redemption that needs to swap
+//! yield-token → stable. New this round — see /yield-sources.
+//!
+//! Accounts: [admin, pool, yield_source]
+//! Data: ()
+
+use pinocchio::{account::AccountView, ProgramResult};
+
+use crate::errors::FleetError;
+use crate::pda::*;
+use crate::state::{load_pool_mut, load_yield_source_mut, save_yield_source};
+
+pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
+    let [admin, pool, yield_source, ..] = accounts else {
+        return Err(FleetError::InvalidAccountData.into());
+    };
+    require_signer(admin)?;
+    let p = load_pool_mut(pool)?;
+    if !p.assert_admin(admin.address().as_array()) { return Err(FleetError::Unauthorized.into()); }
+
+    let mut ys = load_yield_source_mut(yield_source)?;
+    if ys.pool != *pool.address().as_array() { return Err(FleetError::Unauthorized.into()); }
+    ys.is_active = 0;
+    save_yield_source(yield_source, &ys)?;
+    Ok(())
+}`
+},
+{
+  path: "pinochio/src/instructions/earmark_loan_capital.rs",
+  status: "U",
+  category: "pinocchio",
+  why: "New instruction (round 2) — admin-only, called by the backend the instant a loan hits the off-chain 'equity received' pipeline stage, before it actually originates on-chain. Creates one EarmarkRecord PDA (its own expiry, keyed on an opaque backend-supplied loan_ref) and bumps PoolState's aggregate earmarked_loan_capital, which helpers/liquidity.rs::compute_elb nets out of instant-redemption liquidity. See /redemption.",
+  original: "",
+  proposed: `//! Admin-only: reserve capital against a loan that's reached the off-chain
+//! "equity received" pipeline stage but hasn't originated on-chain yet.
+//! Creates one EarmarkRecord PDA and bumps PoolState's aggregate. New this
+//! round — see /redemption.
+//!
+//! Accounts: [admin, pool, earmark (init PDA), system_program]
+//! Data: earmark_bump (u8) + loan_ref (u64) + amount (u64)
+
+use pinocchio::{account::AccountView, cpi::{Seed, Signer}, sysvars::{clock::Clock, Sysvar}, ProgramResult};
+
+use crate::constants::*;
+use crate::errors::FleetError;
+use crate::helpers::math::checked_add_u64;
+use crate::helpers::sysprog::{create_pda_account, rent_exempt_minimum};
+use crate::pda::*;
+use crate::state::{earmark_status, load_pool_mut, save_earmark, save_pool, EarmarkRecord, EARMARK_SPACE};
+
+pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [admin, pool, earmark, _system_program, ..] = accounts else {
+        return Err(FleetError::InvalidAccountData.into());
+    };
+    let mut c = 0;
+    let earmark_bump = read_u8(data, &mut c)?;
+    let loan_ref = read_u64(data, &mut c)?;
+    let amount = read_u64(data, &mut c)?;
+
+    require_signer(admin)?;
+    let mut p = load_pool_mut(pool)?;
+    if !p.assert_admin(admin.address().as_array()) { return Err(FleetError::Unauthorized.into()); }
+    if amount == 0 { return Err(FleetError::Overflow.into()); }
+
+    let pool_key = *pool.address().as_array();
+    let loan_ref_le = loan_ref.to_le_bytes();
+    let bump_arr = [earmark_bump];
+    let seeds: [Seed; 4] = [
+        Seed::from(EARMARK_SEED),
+        Seed::from(&pool_key[..]),
+        Seed::from(&loan_ref_le[..]),
+        Seed::from(&bump_arr[..]),
+    ];
+    verify_pda(earmark, &[EARMARK_SEED, &pool_key[..], &loan_ref_le[..]], earmark_bump)?;
+    let signer = [Signer::from(&seeds[..])];
+    create_pda_account(admin, earmark, EARMARK_SPACE as u64, &PROGRAM_ID,
+        rent_exempt_minimum(EARMARK_SPACE as u64), &signer)?;
+
+    let now_ts = Clock::get()?.unix_timestamp;
+    let record = EarmarkRecord {
+        pool: pool_key,
+        loan_ref,
+        amount,
+        created_ts: now_ts,
+        expires_ts: now_ts + EARMARK_EXPIRY_SECS,
+        status: earmark_status::ACTIVE,
+        bump: earmark_bump,
+        _pad: [0u8; 6],
+    };
+    save_earmark(earmark, &record)?;
+
+    p.earmarked_loan_capital = checked_add_u64(p.earmarked_loan_capital, amount)?;
+    save_pool(pool, &p)?;
+    Ok(())
+}`,
+  suggestions: [
+    "originate_loan.rs (unchanged in this round's excerpt) needs a corresponding release call — find the matching EarmarkRecord by loan_ref, mark it RELEASED, and decrement earmarked_loan_capital by its amount — the instant a loan actually originates, so the capital transitions cleanly from 'earmarked' to outstanding_principal instead of double-counting against both.",
+    "Two concurrent equity-received events can each pass the origination liquidity gate before either one's earmark_loan_capital call actually lands, both drawing on the same slice of ELB. EARMARK_EXPIRY_SECS + cancel_earmark.rs's permissionless sweep bounds the damage but doesn't prevent it — the real fix is serializing equity-received processing in the backend, not something this PDA layout alone can guarantee.",
+  ],
+},
+{
+  path: "pinochio/src/instructions/cancel_earmark.rs",
+  status: "U",
+  category: "pinocchio",
+  why: "New instruction (round 2) — releases an earmark, either admin-cancelled any time (the deal fell through) or, permissionlessly, by anyone once expires_ts has passed. The permissionless branch is the hardening this round adds on top of the base earmark/cancel design: it bounds how long a forgotten admin cancellation can over-reserve capital, the same 'don't rely on someone remembering to call it' concern already flagged for flag_pending_default on /open-questions.",
+  original: "",
+  proposed: `//! Release an earmark — admin-cancelled any time, or permissionlessly by
+//! anyone once expires_ts has passed (a backstop against a forgotten admin
+//! cancellation permanently over-reserving capital). New this round — see
+//! /redemption.
+//!
+//! Accounts: [caller, pool, earmark]
+//! Data: ()
+
+use pinocchio::{account::AccountView, sysvars::{clock::Clock, Sysvar}, ProgramResult};
+
+use crate::errors::FleetError;
+use crate::pda::*;
+use crate::state::{earmark_status, load_earmark_mut, load_pool_mut, save_earmark, save_pool};
+
+pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
+    let [caller, pool, earmark, ..] = accounts else {
+        return Err(FleetError::InvalidAccountData.into());
+    };
+    require_signer(caller)?;
+    let mut p = load_pool_mut(pool)?;
+    let mut record = load_earmark_mut(earmark)?;
+    if record.pool != *pool.address().as_array() { return Err(FleetError::Unauthorized.into()); }
+    if record.status != earmark_status::ACTIVE { return Err(FleetError::InvalidAccountData.into()); }
+
+    if !p.assert_admin(caller.address().as_array()) {
+        let now_ts = Clock::get()?.unix_timestamp;
+        if now_ts < record.expires_ts {
+            return Err(FleetError::EarmarkNotYetExpired.into());
+        }
+    }
+
+    p.earmarked_loan_capital = p.earmarked_loan_capital.saturating_sub(record.amount);
+    record.status = earmark_status::CANCELLED;
+    save_earmark(earmark, &record)?;
+    save_pool(pool, &p)?;
+    Ok(())
+}`
+},
+{
+  path: "pinochio/src/helpers/redemption.rs",
+  status: "M",
+  category: "pinocchio",
+  why: "Adds execute_accelerated_redemption_payout alongside the existing execute_redemption_payout, which stays untouched and keeps backing process_redemption.rs's unchanged standard-queue path. The new function's fee is computed BEFORE it's ever called (helpers/liquidity.rs::instant_redemption_fee) — only the NET amount actually gets swapped and paid to the investor; the fee-portion tokens never enter the swap, since they're settled as FYC (transferred or converted, not USDC) by accelerated_redeem.rs. Also drops the single flat protocol_fee_recipient split this file used to do post-swap — round 2's fee never touches USDC at all.",
+  original: `//! Redemption payout: USYC→USDC swap then split investor / protocol fee.
+
+use pinocchio::{account::AccountView, error::ProgramError, cpi::Signer, Address};
+use pinocchio_token::instructions::Transfer;
+
+use crate::constants::BPS_DENOMINATOR;
+use crate::errors::FleetError;
+use crate::helpers::math::{checked_sub_u64, mul_div_u64};
+use crate::helpers::swap::execute_jupiter_swap_to_deposit;
+
+pub struct RedemptionPayout {
+    pub usdc_received: u64,
+    pub usyc_spent: u64,
+    pub investor_usdc: u64,
+    pub protocol_fee_usdc: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_redemption_payout(
+    jupiter_program: &AccountView,
+    base_yield_token_vault: &AccountView,
+    deposit_token_vault: &AccountView,
+    investor_deposit_token_account: &AccountView,
+    protocol_deposit_token_account: &AccountView,
+    pool_account: &AccountView,
+    pool_signer_addresses: &[&Address],
+    pool_signer_seeds: &[Signer],
+    gross_usd_payout: u64,
+    fee_bps: u64,
+    route_accounts: &[AccountView],
+    route_data: &[u8],
+) -> Result<RedemptionPayout, ProgramError> {
+    if gross_usd_payout == 0 {
+        return Err(FleetError::SwapOutputBelowMinimum.into());
+    }
+
+    let (usyc_spent, usdc_received) = execute_jupiter_swap_to_deposit(
+        jupiter_program,
+        base_yield_token_vault,
+        deposit_token_vault,
+        gross_usd_payout,
+        route_accounts,
+        route_data,
+        pool_signer_addresses,
+        pool_signer_seeds,
+    )?;
+
+    let protocol_fee_usdc = mul_div_u64(usdc_received, fee_bps, BPS_DENOMINATOR)?;
+    let investor_usdc = checked_sub_u64(usdc_received, protocol_fee_usdc)?;
+
+    if investor_usdc > 0 {
+        Transfer::new(deposit_token_vault, investor_deposit_token_account, pool_account, investor_usdc)
+        .invoke_signed(pool_signer_seeds)?;
+    }
+    if protocol_fee_usdc > 0 {
+        Transfer::new(deposit_token_vault, protocol_deposit_token_account, pool_account, protocol_fee_usdc)
+        .invoke_signed(pool_signer_seeds)?;
+    }
+
+    Ok(RedemptionPayout { usdc_received, usyc_spent, investor_usdc, protocol_fee_usdc })
+}`,
+  proposed: `//! Redemption payout. execute_redemption_payout (unchanged) still backs
+//! process_redemption.rs's standard 30d/90d-queue path — USYC→USDC swap,
+//! then a flat fee split off the USDC. NEW (round 2):
+//! execute_accelerated_redemption_payout backs the instant path instead —
+//! see /redemption.
+
+use pinocchio::{account::AccountView, error::ProgramError, cpi::Signer, Address};
+use pinocchio_token::instructions::Transfer;
+
+use crate::constants::BPS_DENOMINATOR;
+use crate::errors::FleetError;
+use crate::helpers::math::{checked_sub_u64, mul_div_u64};
+use crate::helpers::swap::execute_jupiter_swap_to_deposit;
+
+pub struct RedemptionPayout {
+    pub usdc_received: u64,
+    pub usyc_spent: u64,
+    pub investor_usdc: u64,
+    pub protocol_fee_usdc: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_redemption_payout(
+    jupiter_program: &AccountView,
+    base_yield_token_vault: &AccountView,
+    deposit_token_vault: &AccountView,
+    investor_deposit_token_account: &AccountView,
+    protocol_deposit_token_account: &AccountView,
+    pool_account: &AccountView,
+    pool_signer_addresses: &[&Address],
+    pool_signer_seeds: &[Signer],
+    gross_usd_payout: u64,
+    fee_bps: u64,
+    route_accounts: &[AccountView],
+    route_data: &[u8],
+) -> Result<RedemptionPayout, ProgramError> {
+    if gross_usd_payout == 0 {
+        return Err(FleetError::SwapOutputBelowMinimum.into());
+    }
+
+    let (usyc_spent, usdc_received) = execute_jupiter_swap_to_deposit(
+        jupiter_program,
+        base_yield_token_vault,
+        deposit_token_vault,
+        gross_usd_payout,
+        route_accounts,
+        route_data,
+        pool_signer_addresses,
+        pool_signer_seeds,
+    )?;
+
+    let protocol_fee_usdc = mul_div_u64(usdc_received, fee_bps, BPS_DENOMINATOR)?;
+    let investor_usdc = checked_sub_u64(usdc_received, protocol_fee_usdc)?;
+
+    if investor_usdc > 0 {
+        Transfer::new(deposit_token_vault, investor_deposit_token_account, pool_account, investor_usdc)
+        .invoke_signed(pool_signer_seeds)?;
+    }
+    if protocol_fee_usdc > 0 {
+        Transfer::new(deposit_token_vault, protocol_deposit_token_account, pool_account, protocol_fee_usdc)
+        .invoke_signed(pool_signer_seeds)?;
+    }
+
+    Ok(RedemptionPayout { usdc_received, usyc_spent, investor_usdc, protocol_fee_usdc })
+}
+
+pub struct AcceleratedPayout {
+    pub usdc_received: u64,
+    pub usyc_spent: u64,
+}
+
+/// NEW (round 2) — the accelerated-redemption swap+payout leg. The fee is
+/// computed BEFORE this is ever called (helpers/liquidity.rs::instant_redemption_fee)
+/// — only the NET amount (post-fee) is swapped and paid to the investor; the
+/// fee-portion tokens never enter this swap at all, since they're settled as
+/// FYC by the caller (transferred if redeeming FYC, converted via jr_to_sr if
+/// redeeming FFC), never as USDC.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_accelerated_redemption_payout(
+    jupiter_program: &AccountView,
+    base_yield_token_vault: &AccountView,
+    deposit_token_vault: &AccountView,
+    investor_deposit_token_account: &AccountView,
+    pool_account: &AccountView,
+    pool_signer_addresses: &[&Address],
+    pool_signer_seeds: &[Signer],
+    net_usd_payout: u64,
+    route_accounts: &[AccountView],
+    route_data: &[u8],
+) -> Result<AcceleratedPayout, ProgramError> {
+    if net_usd_payout == 0 {
+        return Err(FleetError::SwapOutputBelowMinimum.into());
+    }
+    let (usyc_spent, usdc_received) = execute_jupiter_swap_to_deposit(
+        jupiter_program,
+        base_yield_token_vault,
+        deposit_token_vault,
+        net_usd_payout,
+        route_accounts,
+        route_data,
+        pool_signer_addresses,
+        pool_signer_seeds,
+    )?;
+    if usdc_received > 0 {
+        Transfer::new(deposit_token_vault, investor_deposit_token_account, pool_account, usdc_received)
+            .invoke_signed(pool_signer_seeds)?;
+    }
+    Ok(AcceleratedPayout { usdc_received, usyc_spent })
+}`
+},
+{
+  path: "pinochio/src/instructions/accelerated_redeem.rs",
+  status: "M",
+  category: "pinocchio",
+  why: "Replaces the flat accelerated_redemption_fee_bps with the liquidity-scaled formula from helpers/liquidity.rs, and changes fee settlement entirely: FYC fee-portion tokens are transferred (never burned) straight to protocol/insurance FYC token accounts; FFC fee-portion tokens are burned and the equivalent value minted as new FYC via helpers/tranche_convert.rs::jr_to_sr — protocol/insurance treasuries never hold first-loss (FFC) exposure. Also the first place an actual liquidity check exists before attempting the swap — the original version had none, relying on the Jupiter CPI failing naturally if the vault was short.",
+  original: `//! Accelerated redemption: investor pays a fee to skip the queue (Spec 11.4).
+//!
+//! Accounts (Anchor order):
+//!   0  investor (signer, writable)
+//!   1  pool (writable)
+//!   2  tranche (writable)
+//!   3  tranche_mint (writable)
+//!   4  investor_tranche_account (writable)
+//!   5  investor_deposit_token_account (writable)
+//!   6  deposit_token_vault (writable)
+//!   7  base_yield_token_vault (writable)
+//!   8  protocol_deposit_token_account (writable)
+//!   9  jupiter_program
+//!  10  token_program
+//!  11.. route accounts
+//!
+//! Data: tokens_requested (u64) + var route_data
+
+use pinocchio::{
+    account::AccountView,
+    cpi::{Seed, Signer},
+    ProgramResult,
+};
+use pinocchio_token::instructions::Burn;
+
+use crate::constants::*;
+use crate::errors::FleetError;
+use crate::helpers::math::checked_sub_u64;
+use crate::helpers::pricing::usd_for_tokens;
+use crate::helpers::redemption::execute_redemption_payout;
+use crate::helpers::token_account::{token_account_mint, token_account_owner};
+use crate::helpers::waterfall::ensure_not_paused;
+use crate::pda::*;
+use crate::state::{load_pool_mut, load_tranche_mut, save_pool, save_tranche};
+
+pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    if accounts.len() < 11 { return Err(FleetError::InvalidAccountData.into()); }
+    let investor = &accounts[0];
+    let pool = &accounts[1];
+    let tranche = &accounts[2];
+    let tranche_mint = &accounts[3];
+    let investor_tranche_acc = &accounts[4];
+    let investor_dep_acc = &accounts[5];
+    let deposit_vault = &accounts[6];
+    let base_vault = &accounts[7];
+    let protocol_dep_acc = &accounts[8];
+    let jupiter_program = &accounts[9];
+    let _token_program = &accounts[10];
+    let route_accounts = &accounts[11..];
+
+    let mut c = 0;
+    let tokens_requested = read_u64(data, &mut c)?;
+    let route_data = read_var(data, &mut c)?;
+
+    require_signer(investor)?;
+    let mut p = load_pool_mut(pool)?;
+    ensure_not_paused(&p)?;
+    if tokens_requested == 0 { return Err(FleetError::Overflow.into()); }
+    if route_data.is_empty() { return Err(FleetError::AcceleratedSwapBelowMinimum.into()); }
+
+    let mut t = load_tranche_mut(tranche)?;
+    let tranche_key = *tranche.address().as_array();
+    if tranche_key != p.fyc_tranche && tranche_key != p.ffc_tranche {
+        return Err(FleetError::TrancheMismatch.into());
+    }
+    if t.token_mint != *tranche_mint.address().as_array() {
+        return Err(FleetError::TrancheMismatch.into());
+    }
+    if p.deposit_token_vault != *deposit_vault.address().as_array()
+        || p.base_yield_token_vault != *base_vault.address().as_array()
+    { return Err(FleetError::Unauthorized.into()); }
+    if token_account_owner(protocol_dep_acc)? != p.protocol_fee_recipient
+        || token_account_mint(protocol_dep_acc)? != p.deposit_token_mint
+    { return Err(FleetError::Unauthorized.into()); }
+
+    let price_used = t.conservative_price;
+    let gross_usd = usd_for_tokens(tokens_requested, price_used)?;
+    if gross_usd == 0 { return Err(FleetError::AcceleratedSwapBelowMinimum.into()); }
+    let fee_bps = p.accelerated_redemption_fee_bps;
+
+    let auth_key = p.authority;
+    let pool_bump_arr = [p.bump];
+    let pool_seeds: [Seed; 3] = [
+        Seed::from(POOL_SEED),
+        Seed::from(&auth_key[..]),
+        Seed::from(&pool_bump_arr[..]),
+    ];
+    let pool_signer = [Signer::from(&pool_seeds[..])];
+
+    // 1. Burn investor's tranche tokens.
+    Burn::new(investor_tranche_acc, tranche_mint, investor, tokens_requested).invoke()?;
+
+    // 2. Swap + payout.
+    let payout = execute_redemption_payout(
+        jupiter_program, base_vault, deposit_vault,
+        investor_dep_acc, protocol_dep_acc, pool,
+        &[pool.address()], &pool_signer,
+        gross_usd, fee_bps,
+        route_accounts, route_data,
+    )?;
+
+    // 3. Bookkeeping.
+    t.v_tranche = checked_sub_u64(t.v_tranche, gross_usd)?;
+    t.total_supply = checked_sub_u64(t.total_supply, tokens_requested)?;
+    p.c_tokens = checked_sub_u64(p.c_tokens, payout.usyc_spent)?;
+    if t.tranche_type == TRANCHE_FFC {
+        p.pending_ffc_redemptions = p.pending_ffc_redemptions.saturating_sub(gross_usd);
+    }
+
+    save_pool(pool, &p)?;
+    save_tranche(tranche, &t)?;
+    Ok(())
+}`,
+  proposed: `//! Accelerated redemption: liquidity-scaled fee instead of a flat one,
+//! settled entirely as FYC — transferred if redeeming FYC, converted via
+//! jr_to_sr if redeeming FFC, so protocol/insurance treasuries never hold
+//! first-loss (FFC) exposure. New this round — see /redemption,
+//! /tranche-swap. The standard (30d/90d queue) path in
+//! process_redemption.rs is unchanged.
+//!
+//! Accounts (Anchor order):
+//!   0  investor (signer, writable)
+//!   1  pool (writable)
+//!   2  fyc_tranche (writable)
+//!   3  fyc_mint (writable)
+//!   4  ffc_tranche (writable)
+//!   5  ffc_mint (writable)
+//!   6  investor_tranche_account (writable) — the mint matching redeem_tranche
+//!   7  investor_deposit_token_account (writable)
+//!   8  deposit_token_vault (writable)
+//!   9  base_yield_token_vault (writable)
+//!  10  protocol_fyc_account (writable) — protocol_wallet's FYC token account
+//!  11  insurance_fyc_account (writable) — insurance_wallet's FYC token account
+//!  12  jupiter_program
+//!  13  token_program
+//!  14.. route accounts
+//!
+//! Data: redeem_tranche (u8) + tokens_requested (u64) + var route_data
+
+use pinocchio::{
+    account::AccountView,
+    cpi::{Seed, Signer},
+    ProgramResult,
+};
+use pinocchio_token::instructions::{Burn, MintTo, Transfer};
+
+use crate::constants::*;
+use crate::errors::FleetError;
+use crate::helpers::liquidity::{compute_elb, instant_redemption_fee};
+use crate::helpers::math::{checked_sub_u64, mul_div_u64};
+use crate::helpers::pricing::usd_for_tokens;
+use crate::helpers::redemption::execute_accelerated_redemption_payout;
+use crate::helpers::tranche_convert::jr_to_sr;
+use crate::helpers::waterfall::ensure_not_paused;
+use crate::pda::*;
+use crate::state::{load_pool_mut, load_tranche_mut, save_pool, save_tranche};
+
+pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    if accounts.len() < 14 { return Err(FleetError::InvalidAccountData.into()); }
+    let investor = &accounts[0];
+    let pool = &accounts[1];
+    let fyc_tranche = &accounts[2];
+    let fyc_mint = &accounts[3];
+    let ffc_tranche = &accounts[4];
+    let ffc_mint = &accounts[5];
+    let investor_tranche_acc = &accounts[6];
+    let investor_dep_acc = &accounts[7];
+    let deposit_vault = &accounts[8];
+    let base_vault = &accounts[9];
+    let protocol_fyc_acc = &accounts[10];
+    let insurance_fyc_acc = &accounts[11];
+    let jupiter_program = &accounts[12];
+    let _token_program = &accounts[13];
+    let route_accounts = &accounts[14..];
+
+    let mut c = 0;
+    let redeem_tranche = read_u8(data, &mut c)?;
+    let tokens_requested = read_u64(data, &mut c)?;
+    let route_data = read_var(data, &mut c)?;
+    let is_fyc = redeem_tranche == TRANCHE_FYC;
+
+    require_signer(investor)?;
+    let mut p = load_pool_mut(pool)?;
+    ensure_not_paused(&p)?;
+    if tokens_requested == 0 { return Err(FleetError::Overflow.into()); }
+    if route_data.is_empty() { return Err(FleetError::AcceleratedSwapBelowMinimum.into()); }
+
+    let mut fyc = load_tranche_mut(fyc_tranche)?;
+    let mut ffc = load_tranche_mut(ffc_tranche)?;
+    let price_used = if is_fyc { fyc.conservative_price } else { ffc.conservative_price };
+    let gross_usd = usd_for_tokens(tokens_requested, price_used)?;
+    if gross_usd == 0 { return Err(FleetError::AcceleratedSwapBelowMinimum.into()); }
+
+    // NEW — an actual liquidity check before attempting the swap at all. The
+    // original version had none; it just let the Jupiter CPI fail naturally
+    // if the vault was short.
+    let elb = compute_elb(&p, &fyc, &ffc)?;
+    let elb_tranche = if is_fyc { elb.fyc } else { elb.ffc };
+    let pending = if is_fyc { p.pending_fyc_redemptions } else { p.pending_ffc_redemptions };
+    let fee = instant_redemption_fee(redeem_tranche, gross_usd, elb_tranche.saturating_sub(pending))?;
+
+    let auth_key = p.authority;
+    let pool_bump_arr = [p.bump];
+    let pool_seeds: [Seed; 3] = [
+        Seed::from(POOL_SEED),
+        Seed::from(&auth_key[..]),
+        Seed::from(&pool_bump_arr[..]),
+    ];
+    let pool_signer = [Signer::from(&pool_seeds[..])];
+
+    if is_fyc {
+        // Fee-portion FYC tokens are TRANSFERRED, never burned — only the
+        // net portion actually leaves v_tranche/total_supply.
+        let fee_tokens = if price_used > 0 { mul_div_u64(fee.fee_value, PRECISION, price_used)? } else { 0 };
+        let net_tokens = tokens_requested.saturating_sub(fee_tokens);
+        Burn::new(investor_tranche_acc, fyc_mint, investor, net_tokens).invoke()?;
+        if fee_tokens > 0 {
+            let half = fee_tokens / 2;
+            Transfer::new(investor_tranche_acc, protocol_fyc_acc, investor, half).invoke()?;
+            Transfer::new(investor_tranche_acc, insurance_fyc_acc, investor, fee_tokens - half).invoke()?;
+        }
+        fyc.v_tranche = checked_sub_u64(fyc.v_tranche, fee.net_payout)?;
+        fyc.total_supply = fyc.total_supply.saturating_sub(net_tokens);
+    } else {
+        // The FULL amount is burned — net portion pays the investor, fee
+        // portion converts up to FYC via jr_to_sr instead of paying out or
+        // sitting in the treasury as first-loss exposure.
+        Burn::new(investor_tranche_acc, ffc_mint, investor, tokens_requested).invoke()?;
+        ffc.v_tranche = checked_sub_u64(ffc.v_tranche, gross_usd)?;
+        ffc.total_supply = ffc.total_supply.saturating_sub(tokens_requested);
+
+        let fee_ffc_tokens = if price_used > 0 { mul_div_u64(fee.fee_value, PRECISION, price_used)? } else { 0 };
+        // Hardening from review: a fee-side conversion must never revert the
+        // investor's whole redemption. If jr_to_sr's severity re-check
+        // trips, skip the conversion for this slice rather than failing —
+        // production would route it into a suspense FFC balance instead of
+        // dropping it; illustrative here. See /tranche-swap, /open-questions.
+        if let Ok(result) = jr_to_sr(&p, &mut fyc, &mut ffc, fee_ffc_tokens) {
+            let half = result.tokens_out / 2;
+            MintTo::new(fyc_mint, protocol_fyc_acc, pool, half).invoke_signed(&pool_signer)?;
+            MintTo::new(fyc_mint, insurance_fyc_acc, pool, result.tokens_out - half).invoke_signed(&pool_signer)?;
+        }
+    }
+
+    let payout = execute_accelerated_redemption_payout(
+        jupiter_program, base_vault, deposit_vault, investor_dep_acc, pool,
+        &[pool.address()], &pool_signer, fee.net_payout, route_accounts, route_data,
+    )?;
+    p.c_tokens = checked_sub_u64(p.c_tokens, payout.usyc_spent)?;
+
+    save_pool(pool, &p)?;
+    save_tranche(fyc_tranche, &fyc)?;
+    save_tranche(ffc_tranche, &ffc)?;
+    Ok(())
+}`,
+  suggestions: [
+    "The suspense-balance fallback for a rejected fee-conversion is only a comment here, not implemented — production needs a real place to park an un-converted FFC fee (a suspense field on TrancheState, most likely) and a way to sweep it back through jr_to_sr later once headroom exists, instead of silently dropping it as this illustrative version does.",
+    "instant_redemption_fee (helpers/liquidity.rs) is called once per instruction with a live elb_tranche read — a caller splitting one large redemption into several accelerated_redeem calls within one transaction converges the average fee toward fee_min. Worth deciding whether to snapshot elb_tranche once per top-level transaction, or adopt the split-invariant integral fee formula noted on /open-questions.",
+    "set_redemption_fees.rs's accelerated_bps admin knob is now vestigial — nothing here reads p.accelerated_redemption_fee_bps anymore, the liquidity-scaled formula replaced it entirely. Worth an explicit decision on removing that field/setter rather than leaving a dead admin control live.",
+  ],
+},
+{
+  path: "pinochio/src/instructions/submit_redemption.rs",
+  status: "M",
+  category: "pinocchio",
+  why: "Tracks pending_fyc_redemptions now too, not just pending_ffc_redemptions. Before this, a queued FYC redemption was invisible to both the ELB liquidity split (helpers/liquidity.rs) and the new origination liquidity gate (helpers/coverage.rs::assert_liquidity_available_for_origination) — only FFC's side ever showed up anywhere.",
+  original: `//! Submit a redemption request: lock investor's tranche tokens in escrow PDA.
+//!
+//! Accounts (Anchor order):
+//!   0  investor (signer, writable)
+//!   1  pool (writable)
+//!   2  tranche (writable)
+//!   3  tranche_mint (writable)
+//!   4  investor_tranche_account (writable)
+//!   5  escrow_account (init token account, writable)
+//!   6  request (init PDA, writable)
+//!   7  token_program
+//!   8  system_program
+//!   9  rent
+//!
+//! Data: request_bump (u8) + escrow_bump (u8) + request_id (u64) + tokens_requested (u64)
+
+use pinocchio::{
+    account::AccountView,
+    cpi::{Seed, Signer},
+    sysvars::{clock::Clock, Sysvar},
+    ProgramResult,
+};
+use pinocchio_token::instructions::{InitializeAccount3, Transfer};
+
+use crate::constants::*;
+use crate::errors::FleetError;
+use crate::helpers::math::checked_add_u64;
+use crate::helpers::pricing::usd_for_tokens;
+use crate::helpers::sysprog::{create_pda_account, rent_exempt_minimum};
+use crate::helpers::waterfall::ensure_not_paused;
+use crate::pda::*;
+use crate::state::{
+    load_pool_mut, load_tranche, redemption_status, save_pool, save_redemption, RedemptionRequest,
+    REDEMPTION_SPACE,
+};
+
+const TOKEN_ACCOUNT_LEN: u64 = 165;
+
+pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [
+        investor, pool, tranche, tranche_mint, investor_tranche_acc,
+        escrow_account, request, token_program, _system_program, _rent_sysvar, ..
+    ] = accounts else { return Err(FleetError::InvalidAccountData.into()) };
+
+    let mut c = 0;
+    let request_bump = read_u8(data, &mut c)?;
+    let escrow_bump = read_u8(data, &mut c)?;
+    let request_id = read_u64(data, &mut c)?;
+    let tokens_requested = read_u64(data, &mut c)?;
+
+    require_signer(investor)?;
+    let mut p = load_pool_mut(pool)?;
+    ensure_not_paused(&p)?;
+    if tokens_requested == 0 { return Err(FleetError::Overflow.into()); }
+    let t = load_tranche(tranche)?;
+    let tranche_key = *tranche.address().as_array();
+    if tranche_key != p.fyc_tranche && tranche_key != p.ffc_tranche {
+        return Err(FleetError::TrancheMismatch.into());
+    }
+    if t.token_mint != *tranche_mint.address().as_array() {
+        return Err(FleetError::TrancheMismatch.into());
+    }
+
+    let now_ts = Clock::get()?.unix_timestamp;
+    let lock_seconds = if t.tranche_type == TRANCHE_FFC {
+        FFC_REDEMPTION_LOCK_SECS
+    } else { FYC_REDEMPTION_LOCK_SECS };
+
+    // 1. Create escrow token account (PDA).
+    let investor_key = *investor.address().as_array();
+    let request_id_le = request_id.to_le_bytes();
+    let escrow_bump_arr = [escrow_bump];
+    let escrow_seeds: [Seed; 5] = [
+        Seed::from(ESCROW_SEED),
+        Seed::from(&tranche_key[..]),
+        Seed::from(&investor_key[..]),
+        Seed::from(&request_id_le[..]),
+        Seed::from(&escrow_bump_arr[..]),
+    ];
+    verify_pda(escrow_account, &[ESCROW_SEED, &tranche_key[..], &investor_key[..], &request_id_le[..]], escrow_bump)?;
+    let escrow_signer = [Signer::from(&escrow_seeds[..])];
+    pinocchio_system::instructions::CreateAccount {
+        from: investor,
+        to: escrow_account,
+        lamports: rent_exempt_minimum(TOKEN_ACCOUNT_LEN),
+        space: TOKEN_ACCOUNT_LEN,
+        owner: &pinocchio_token::ID,
+    }.invoke_signed(&escrow_signer)?;
+    InitializeAccount3 {
+        account: escrow_account,
+        mint: tranche_mint,
+        owner: pool.address(),
+    }.invoke()?;
+
+    // 2. Create the request PDA.
+    let req_bump_arr = [request_bump];
+    let req_seeds: [Seed; 5] = [
+        Seed::from(REDEEM_SEED),
+        Seed::from(&tranche_key[..]),
+        Seed::from(&investor_key[..]),
+        Seed::from(&request_id_le[..]),
+        Seed::from(&req_bump_arr[..]),
+    ];
+    verify_pda(request, &[REDEEM_SEED, &tranche_key[..], &investor_key[..], &request_id_le[..]], request_bump)?;
+    let req_signer = [Signer::from(&req_seeds[..])];
+    create_pda_account(investor, request, REDEMPTION_SPACE as u64, &PROGRAM_ID,
+        rent_exempt_minimum(REDEMPTION_SPACE as u64), &req_signer)?;
+
+    // 3. Transfer tokens to escrow.
+    let _ = token_program;
+    Transfer::new(investor_tranche_acc, escrow_account, investor, tokens_requested).invoke()?;
+
+    // 4. Save request.
+    let req = RedemptionRequest {
+        tranche: tranche_key,
+        requester: investor_key,
+        request_id,
+        tokens_locked: tokens_requested,
+        request_ts: now_ts,
+        eligible_ts: now_ts + lock_seconds,
+        status: redemption_status::PENDING,
+        bump: request_bump,
+        _pad: [0u8; 6],
+    };
+    save_redemption(request, &req)?;
+
+    // 5. Pool bookkeeping for FFC pending redemptions.
+    if t.tranche_type == TRANCHE_FFC {
+        let usd = usd_for_tokens(tokens_requested, t.conservative_price)?;
+        p.pending_ffc_redemptions = checked_add_u64(p.pending_ffc_redemptions, usd)?;
+        save_pool(pool, &p)?;
+    }
+    Ok(())
+}`,
+  proposed: `//! Submit a redemption request: lock investor's tranche tokens in escrow PDA.
+//! Round 2: pending_fyc_redemptions is now tracked alongside
+//! pending_ffc_redemptions — previously only FFC's side fed the ELB
+//! liquidity split and the origination liquidity gate.
+//!
+//! Accounts (Anchor order):
+//!   0  investor (signer, writable)
+//!   1  pool (writable)
+//!   2  tranche (writable)
+//!   3  tranche_mint (writable)
+//!   4  investor_tranche_account (writable)
+//!   5  escrow_account (init token account, writable)
+//!   6  request (init PDA, writable)
+//!   7  token_program
+//!   8  system_program
+//!   9  rent
+//!
+//! Data: request_bump (u8) + escrow_bump (u8) + request_id (u64) + tokens_requested (u64)
+
+use pinocchio::{
+    account::AccountView,
+    cpi::{Seed, Signer},
+    sysvars::{clock::Clock, Sysvar},
+    ProgramResult,
+};
+use pinocchio_token::instructions::{InitializeAccount3, Transfer};
+
+use crate::constants::*;
+use crate::errors::FleetError;
+use crate::helpers::math::checked_add_u64;
+use crate::helpers::pricing::usd_for_tokens;
+use crate::helpers::sysprog::{create_pda_account, rent_exempt_minimum};
+use crate::helpers::waterfall::ensure_not_paused;
+use crate::pda::*;
+use crate::state::{
+    load_pool_mut, load_tranche, redemption_status, save_pool, save_redemption, RedemptionRequest,
+    REDEMPTION_SPACE,
+};
+
+const TOKEN_ACCOUNT_LEN: u64 = 165;
+
+pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [
+        investor, pool, tranche, tranche_mint, investor_tranche_acc,
+        escrow_account, request, token_program, _system_program, _rent_sysvar, ..
+    ] = accounts else { return Err(FleetError::InvalidAccountData.into()) };
+
+    let mut c = 0;
+    let request_bump = read_u8(data, &mut c)?;
+    let escrow_bump = read_u8(data, &mut c)?;
+    let request_id = read_u64(data, &mut c)?;
+    let tokens_requested = read_u64(data, &mut c)?;
+
+    require_signer(investor)?;
+    let mut p = load_pool_mut(pool)?;
+    ensure_not_paused(&p)?;
+    if tokens_requested == 0 { return Err(FleetError::Overflow.into()); }
+    let t = load_tranche(tranche)?;
+    let tranche_key = *tranche.address().as_array();
+    if tranche_key != p.fyc_tranche && tranche_key != p.ffc_tranche {
+        return Err(FleetError::TrancheMismatch.into());
+    }
+    if t.token_mint != *tranche_mint.address().as_array() {
+        return Err(FleetError::TrancheMismatch.into());
+    }
+
+    let now_ts = Clock::get()?.unix_timestamp;
+    let lock_seconds = if t.tranche_type == TRANCHE_FFC {
+        FFC_REDEMPTION_LOCK_SECS
+    } else { FYC_REDEMPTION_LOCK_SECS };
+
+    // 1. Create escrow token account (PDA).
+    let investor_key = *investor.address().as_array();
+    let request_id_le = request_id.to_le_bytes();
+    let escrow_bump_arr = [escrow_bump];
+    let escrow_seeds: [Seed; 5] = [
+        Seed::from(ESCROW_SEED),
+        Seed::from(&tranche_key[..]),
+        Seed::from(&investor_key[..]),
+        Seed::from(&request_id_le[..]),
+        Seed::from(&escrow_bump_arr[..]),
+    ];
+    verify_pda(escrow_account, &[ESCROW_SEED, &tranche_key[..], &investor_key[..], &request_id_le[..]], escrow_bump)?;
+    let escrow_signer = [Signer::from(&escrow_seeds[..])];
+    pinocchio_system::instructions::CreateAccount {
+        from: investor,
+        to: escrow_account,
+        lamports: rent_exempt_minimum(TOKEN_ACCOUNT_LEN),
+        space: TOKEN_ACCOUNT_LEN,
+        owner: &pinocchio_token::ID,
+    }.invoke_signed(&escrow_signer)?;
+    InitializeAccount3 {
+        account: escrow_account,
+        mint: tranche_mint,
+        owner: pool.address(),
+    }.invoke()?;
+
+    // 2. Create the request PDA.
+    let req_bump_arr = [request_bump];
+    let req_seeds: [Seed; 5] = [
+        Seed::from(REDEEM_SEED),
+        Seed::from(&tranche_key[..]),
+        Seed::from(&investor_key[..]),
+        Seed::from(&request_id_le[..]),
+        Seed::from(&req_bump_arr[..]),
+    ];
+    verify_pda(request, &[REDEEM_SEED, &tranche_key[..], &investor_key[..], &request_id_le[..]], request_bump)?;
+    let req_signer = [Signer::from(&req_seeds[..])];
+    create_pda_account(investor, request, REDEMPTION_SPACE as u64, &PROGRAM_ID,
+        rent_exempt_minimum(REDEMPTION_SPACE as u64), &req_signer)?;
+
+    // 3. Transfer tokens to escrow.
+    let _ = token_program;
+    Transfer::new(investor_tranche_acc, escrow_account, investor, tokens_requested).invoke()?;
+
+    // 4. Save request.
+    let req = RedemptionRequest {
+        tranche: tranche_key,
+        requester: investor_key,
+        request_id,
+        tokens_locked: tokens_requested,
+        request_ts: now_ts,
+        eligible_ts: now_ts + lock_seconds,
+        status: redemption_status::PENDING,
+        bump: request_bump,
+        _pad: [0u8; 6],
+    };
+    save_redemption(request, &req)?;
+
+    // 5. Pool bookkeeping for pending redemptions — NEW (round 2): FYC is
+    // tracked now too, the same way FFC always was.
+    let usd = usd_for_tokens(tokens_requested, t.conservative_price)?;
+    if t.tranche_type == TRANCHE_FFC {
+        p.pending_ffc_redemptions = checked_add_u64(p.pending_ffc_redemptions, usd)?;
+    } else {
+        p.pending_fyc_redemptions = checked_add_u64(p.pending_fyc_redemptions, usd)?;
+    }
+    save_pool(pool, &p)?;
+    Ok(())
+}`,
+  suggestions: [
+    "process_redemption.rs (unchanged, not included in this round's excerpt) already decrements pending_ffc_redemptions when an FFC request is processed — it needs the mirror-image pending_fyc_redemptions decrement added for FYC requests, or this new field only ever grows and never actually reflects reality.",
+  ],
+},
+{
+  path: "backend/fleets/src/services/repository.ts",
+  status: "M",
+  category: "backend",
+  why: "Excerpt of getTrancheOverview (the investor 'Earn' overview endpoint) — real code, confirmed by reading the live file. Two changes: (1) redeemable_instantly.has_fee was hardcoded false with no fee data at all; now exposes the real fee_bps_min/fee_bps_max per tranche, computed from the exact same ELB-tranche math already sitting right above it — this is the live number frontend/src/components/fleets/SwapCard.tsx should read instead of its own hardcoded pool-size constants (see that file's diff). (2) pendingFycRedemptions was hardcoded to the string \"0\" in the cached pool-state writer because ChainPoolState never had a real field for it — now reads the real decoded value, which only exists once pinochio's new PoolState.pending_fyc_redemptions field (state.rs) and its corresponding IDL/decoder update actually ship. The rest of this large file (loan book, APR annualization, insurance, etc.) is unchanged and outside this excerpt.",
+  original: `    const pendingBI = toBigInt(
+      tranche === TrancheType.FYC
+        ? pool?.pendingFycRedemptions
+        : pool?.pendingFfcRedemptions,
+    );
+
+    // The instant reserve (ELB) is shared by both tranches. What THIS tranche's
+    // holders can redeem instantly is its proportional share of the ELB, split by
+    // each tranche's share of pooled NAV (guide §6.1: ELB × V_tranche / V_pool;
+    // §11.4 fee formula references ELB_FYC / ELB_FFC). e.g. ELB $5,000 with
+    // V_FYC:V_FFC = 2:8 ⇒ FYC redeemable = $1,000, FFC = $4,000. It rebalances
+    // automatically as ELB and the tranche NAVs change after each redeem.
+    const vFycBI = toBigInt(fycTranche?.vTranche);
+    const vFfcBI = toBigInt(ffcTranche?.vTranche);
+    const vTranchesBI = vFycBI + vFfcBI;
+    const trancheVBI = tranche === TrancheType.FYC ? vFycBI : vFfcBI;
+    const elbTrancheBI =
+      vTranchesBI > 0n ? (elbBI * trancheVBI) / vTranchesBI : 0n;
+    const redeemableInstantlyBI =
+      elbTrancheBI > pendingBI ? elbTrancheBI - pendingBI : 0n;
+
+    // ... (unchanged: cTokens/usdyPrice/pctMet/apr/etc. — outside this excerpt)
+
+      liquidity: {
+        reserve_target: {
+          target_usd: baseToUsdString(reserveTargetBI),
+          current_usd: baseToUsdString(elbBI),
+          pct_met: pctMet,
+        },
+        redeemable_instantly: {
+          value_usd: baseToUsdString(redeemableInstantlyBI),
+          lock_days: tranche === TrancheType.FYC ? 30 : 90,
+          has_fee: false,
+        },
+      },
+
+    // ... (elided — poolSnapshots insert etc. outside this excerpt)
+
+      const poolStateRow = {
+        // ...
+        pendingFfcRedemptions: pool.pendingFfcRedemptions.toString(),
+        pendingFycRedemptions: "0",
+        // ...
+      };`,
+  proposed: `    const pendingBI = toBigInt(
+      tranche === TrancheType.FYC
+        ? pool?.pendingFycRedemptions
+        : pool?.pendingFfcRedemptions,
+    );
+
+    // The instant reserve (ELB) is shared by both tranches. What THIS tranche's
+    // holders can redeem instantly is its proportional share of the ELB, split by
+    // each tranche's share of pooled NAV (guide §6.1: ELB × V_tranche / V_pool;
+    // §11.4 fee formula references ELB_FYC / ELB_FFC). e.g. ELB $5,000 with
+    // V_FYC:V_FFC = 2:8 ⇒ FYC redeemable = $1,000, FFC = $4,000. It rebalances
+    // automatically as ELB and the tranche NAVs change after each redeem.
+    const vFycBI = toBigInt(fycTranche?.vTranche);
+    const vFfcBI = toBigInt(ffcTranche?.vTranche);
+    const vTranchesBI = vFycBI + vFfcBI;
+    const trancheVBI = tranche === TrancheType.FYC ? vFycBI : vFfcBI;
+    const elbTrancheBI =
+      vTranchesBI > 0n ? (elbBI * trancheVBI) / vTranchesBI : 0n;
+    const redeemableInstantlyBI =
+      elbTrancheBI > pendingBI ? elbTrancheBI - pendingBI : 0n;
+
+    // NEW (round 2) — the liquidity-scaled instant-redemption fee band. Real
+    // pool-specific bounds could live on poolState instead of these literals
+    // (mirrors pinochio's INSTANT_FEE_BPS_FYC/FFC constants exactly) — kept
+    // as constants here since neither is admin-tunable this round.
+    const feeBpsMin = tranche === TrancheType.FYC ? 10 : 50;
+    const feeBpsMax = tranche === TrancheType.FYC ? 50 : 100;
+
+    // ... (unchanged: cTokens/usdyPrice/pctMet/apr/etc. — outside this excerpt)
+
+      liquidity: {
+        reserve_target: {
+          target_usd: baseToUsdString(reserveTargetBI),
+          current_usd: baseToUsdString(elbBI),
+          pct_met: pctMet,
+        },
+        redeemable_instantly: {
+          value_usd: baseToUsdString(redeemableInstantlyBI),
+          lock_days: tranche === TrancheType.FYC ? 30 : 90,
+          has_fee: true,
+          fee_bps_min: feeBpsMin,
+          fee_bps_max: feeBpsMax,
+        },
+      },
+
+    // ... (elided — poolSnapshots insert etc. outside this excerpt)
+
+      const poolStateRow = {
+        // ...
+        pendingFfcRedemptions: pool.pendingFfcRedemptions.toString(),
+        // NEW (round 2) — was hardcoded "0"; real once ChainPoolState/the IDL
+        // decoder pick up pinochio's new PoolState.pending_fyc_redemptions.
+        pendingFycRedemptions: pool.pendingFycRedemptions.toString(),
+        // ...
+      };`,
+  suggestions: [
+    "value_usd already IS elb_tranche minus pending (redeemableInstantlyBI) — the exact denominator SwapCard.tsx's fee-preview formula needs — so no new field was required beyond fee_bps_min/max. Worth double-checking the frontend actually reads value_usd for this and doesn't re-derive its own ELB estimate.",
+  ],
+},
+{
+  path: "backend/admin/src/app/controllers/page.redemptions.ts",
+  status: "M",
+  category: "backend",
+  why: "Real code, confirmed by reading the live file — the GET /redemptions queue-viewer endpoint (stats, tab_counts, wait-period rows) already exists in full. What's missing, confirmed by grepping every controller/route file: nothing anywhere calls FFLP_Contract.processRedemption or .acceleratedRedeem, even though both already exist on the blockchain service (backend/admin/src/services/blockchain.ts) — they're dead code, never wired to an HTTP route. This adds the missing POST /redemptions/{id}/approve route + handler that actually calls processRedemption, following the exact same shape as the real handleApproveDefault in page.pipeline.ts (repository lookup → on-chain call → DB update → activity log).",
+  original: `// ── Route ─────────────────────────────────────────────────────────────────────
+
+export const redemptionsRoute = createRoute({
+  method: "get", path: "/redemptions",
+  tags: ["Protocol"], summary: "QT redemption queue",
+  security: [{ cookieAuth: [] }],
+  description:
+    "Returns all pending and recent redemption requests. " +
+    "Requests transition: queued → needs_approval (wait period elapsed) → completed (on-chain processed). " +
+    "Use tab_counts to drive the filter tabs in the UI.",
+  responses: {
+    200: { content: { "application/json": { schema: RedemptionsResponse } }, description: "Redemption queue" },
+    401: { content: { "application/json": { schema: z.object({ error: z.string() }).openapi("Unauthorized") } }, description: "Not authenticated" },
+  },
+});
+
+// ── Handler ───────────────────────────────────────────────────────────────────
+
+export async function handleGetRedemptions(deps: {
+  repository: Repository;
+  blockchain: FFLP_Contract;
+}) {
+  const [dbData, proto] = await Promise.all([
+    deps.repository.getRedemptionsData(),
+    deps.blockchain.getProtocolState(),
+  ]);
+
+  // Epoch capacity: maxStandardRedemptionFeeBps % of total NAV (from on-chain pool)
+  let epoch_capacity_usd: string | null = null;
+  if (proto.pool && proto.fyc && proto.ffc) {
+    const totalNav = proto.fyc.vTranche + proto.ffc.vTranche;
+    const capBps   = proto.pool.maxStandardRedemptionFeeBps;
+    const capBI    = (totalNav * capBps) / 10_000n;
+    epoch_capacity_usd = baseToUsdString(capBI);
+  }
+
+  return {
+    stats: {
+      ...dbData.stats,
+      epoch_capacity_usd,
+    },
+    tab_counts: dbData.tab_counts,
+    rows:       dbData.rows,
+  };
+}`,
+  proposed: `// ── Route ─────────────────────────────────────────────────────────────────────
+
+export const redemptionsRoute = createRoute({
+  method: "get", path: "/redemptions",
+  tags: ["Protocol"], summary: "QT redemption queue",
+  security: [{ cookieAuth: [] }],
+  description:
+    "Returns all pending and recent redemption requests. " +
+    "Requests transition: queued → needs_approval (wait period elapsed) → completed (on-chain processed). " +
+    "Use tab_counts to drive the filter tabs in the UI.",
+  responses: {
+    200: { content: { "application/json": { schema: RedemptionsResponse } }, description: "Redemption queue" },
+    401: { content: { "application/json": { schema: z.object({ error: z.string() }).openapi("Unauthorized") } }, description: "Not authenticated" },
+  },
+});
+
+// NEW (round 2) — approve/process a redemption that's reached needs_approval.
+// Mirrors handleApproveDefault's shape exactly (page.pipeline.ts): repository
+// lookup, on-chain call, DB update, activity log.
+export const approveRedemptionRoute = createRoute({
+  method: "post", path: "/redemptions/{id}/approve",
+  tags: ["Protocol"], summary: "Process an eligible redemption on-chain",
+  security: [{ cookieAuth: [] }],
+  description:
+    "Calls the on-chain process_redemption instruction for a request currently in needs_approval. " +
+    "Requires eligible_ts to have already passed — checked both here and by the program itself. " +
+    "Was previously a local-only UI optimistic update (frontend page.tsx) with no backend call at all.",
+  request: { params: z.object({ id: z.string().uuid() }) },
+  responses: {
+    200: {
+      content: { "application/json": { schema: z.object({ ok: z.literal(true), signature: z.string() }) } },
+      description: "Processed on-chain",
+    },
+    400: {
+      content: { "application/json": { schema: z.object({ error: z.string() }) } },
+      description: "Not in needs_approval, or eligible_ts hasn't passed yet",
+    },
+    404: {
+      content: { "application/json": { schema: z.object({ error: z.string() }) } },
+      description: "Redemption request not found",
+    },
+    500: {
+      content: { "application/json": { schema: z.object({ error: z.string() }) } },
+      description: "On-chain call failed",
+    },
+  },
+});
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+export async function handleGetRedemptions(deps: {
+  repository: Repository;
+  blockchain: FFLP_Contract;
+}) {
+  const [dbData, proto] = await Promise.all([
+    deps.repository.getRedemptionsData(),
+    deps.blockchain.getProtocolState(),
+  ]);
+
+  // Epoch capacity: maxStandardRedemptionFeeBps % of total NAV (from on-chain pool)
+  let epoch_capacity_usd: string | null = null;
+  if (proto.pool && proto.fyc && proto.ffc) {
+    const totalNav = proto.fyc.vTranche + proto.ffc.vTranche;
+    const capBps   = proto.pool.maxStandardRedemptionFeeBps;
+    const capBI    = (totalNav * capBps) / 10_000n;
+    epoch_capacity_usd = baseToUsdString(capBI);
+  }
+
+  return {
+    stats: {
+      ...dbData.stats,
+      epoch_capacity_usd,
+    },
+    tab_counts: dbData.tab_counts,
+    rows:       dbData.rows,
+  };
+}
+
+export async function handleApproveRedemption(
+  deps: { repository: Repository; blockchain: FFLP_Contract; actorEmail: string },
+  params: { id: string },
+) {
+  const request = await deps.repository.getRedemptionRequestById(params.id);
+  if (!request) return { error: "not_found" } as const;
+  if (request.status !== "needs_approval") return { error: "not_ready_for_approval" } as const;
+  if (new Date(request.eligible_at ?? 0) > new Date()) return { error: "not_yet_eligible" } as const;
+
+  let signature: string;
+  try {
+    // processRedemption already exists on the blockchain service — it just
+    // never had a route calling it. Same for acceleratedRedeem, unused for
+    // the same reason; that one belongs to the instant path, not this queue.
+    const result = await deps.blockchain.processRedemption(
+      request.tranche === "FYC" ? 0 : 1,
+      new PublicKey(request.wallet_address),
+      BigInt(request.request_id.replace(/\\D/g, "")),
+    );
+    signature = result; // NOTE: processRedemption currently returns a base64
+                         // UNSIGNED tx (buildVersionTxn), not a submitted
+                         // signature — this handler still needs the sign +
+                         // send + confirm step handleApproveDefault's
+                         // approveDefaultOnChain already does internally.
+                         // Flagged, not silently glossed over.
+  } catch (err) {
+    console.error(\`[approve-redemption] on-chain call failed for \${params.id}:\`, err);
+    return { error: "onchain_approve_failed" } as const;
+  }
+
+  await deps.repository.markRedemptionProcessed(params.id, signature);
+
+  logActivity(deps.repository, {
+    actorEmail:  deps.actorEmail,
+    category:    "protocol",
+    action:      "redemption_processed",
+    description: \`\${deps.actorEmail} approved redemption \${request.request_id} (\${request.tranche}, $\${request.amount_usd})\`,
+    entityType:  "redemption",
+    entityId:    params.id,
+    entityLabel: request.request_id,
+    metadata:    { tx_sig: signature },
+  });
+
+  return { ok: true as const, signature };
+}`,
+  suggestions: [
+    "processRedemption (blockchain.ts) returns an unsigned base64 transaction (buildVersionTxn), not a submitted signature — unlike approveDefaultOnChain, which signs and sends internally. This handler needs the same sign+send+confirm step added to processRedemption itself (or inline here) before it actually does anything on-chain; called out in the code comment rather than silently assumed to work.",
+    "This route only covers the scheduled (30d/90d) queue. The loan-origination liquidity check (assert_liquidity_available_for_origination, pinochio side) has no backend-side mirror yet — page.pipeline.ts's loan-approval flow should show admins a warning when approving a loan would draw on capital needed for requests visible on this exact page, but that cross-reference doesn't exist yet.",
+  ],
+},
+{
+  path: "frontend/src/app/portal-admin/(app)/redemptions/page.tsx",
+  status: "M",
+  category: "frontend",
+  why: "Real code, confirmed by reading the live file — the redemptions queue page, tabs, and wait-period progress bars already exist in full, including an 'Approve' button. approveRequest(id), though, is confirmed to be a LOCAL-ONLY React state mutation — it flips the row to 'processing' in the UI and calls no backend endpoint at all. Wires it to the new POST /redemptions/{id}/approve route (page.redemptions.ts) instead.",
+  original: `  function approveRequest(id: string) {
+    setQueue(q => Array.isArray(q) ? q.map(r => r.id === id ? { ...r, status: 'processing' as const } : r) : []);
+  }`,
+  proposed: `  const [approvingId, setApprovingId] = useState<string | null>(null);
+
+  // CHANGED (round 2) — was a local-only optimistic update with no backend
+  // call; now actually calls the new approve endpoint (page.redemptions.ts)
+  // and rolls the optimistic update back on failure instead of assuming success.
+  async function approveRequest(id: string) {
+    setApprovingId(id);
+    setQueue(q => Array.isArray(q) ? q.map(r => r.id === id ? { ...r, status: 'processing' as const } : r) : []);
+    try {
+      await approveRedemption(id); // apiClient.ts — added the same way approveApplication already is
+    } catch (err) {
+      console.error('[redemptions] approve failed:', err);
+      setQueue(q => Array.isArray(q) ? q.map(r => r.id === id ? { ...r, status: 'needs_approval' as const } : r) : []);
+    } finally {
+      setApprovingId(null);
+    }
+  }`,
+  suggestions: [
+    "apiClient.ts needs a matching approveRedemption(id) export, added the exact same way approveApplication(id) already is: adminApiFetch(\`/redemptions/\\${id}/approve\`, { method: 'POST' }) — not included as its own diff entry here since it's a one-line mirror of an existing pattern.",
+    "The Approve button itself (further down this file) should disable/spin while approvingId === r.id — not shown in this excerpt, but needed so a slow on-chain confirmation doesn't invite a double-click double-submit.",
+  ],
+},
+{
+  path: "frontend/src/components/fleets/SwapCard.tsx",
+  status: "M",
+  category: "frontend",
+  why: "Real code, confirmed by reading the live file — the Instant/Scheduled redeem toggle and fee-scale preview already exist in full, but the fee curve is computed against two HARDCODED magic constants (2_400_000 for FFC, 13_581_107 for FYC) standing in for pool size, not any live value. Replaces them with the real elb_tranche the backend now exposes (backend/fleets/src/services/repository.ts's liquidity.redeemable_instantly.value_usd, fee_bps_min/max) — the exact same endpoint-rate formula, now against a real, live denominator that actually shrinks as redemptions happen instead of two numbers frozen at whatever the pool looked like when someone hardcoded them.",
+  original: `        {!isMint && (
+          <>
+            <div style={{ marginTop: 14 }}>
+              <Segmented options={['Instant', 'Scheduled']} value={redeemMode} onChange={setRedeemMode} />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13.5, marginTop: 14 }}>
+              <span style={{ color: 'var(--fleets-fg-50)' }}>
+                {redeemMode === 'Instant' ? 'Redemption Fee' : 'Processing'}
+              </span>
+              <span style={{ color: 'var(--fleets-fg-80)', fontWeight: 500, fontVariantNumeric: 'tabular-nums' }}>
+                {redeemMode === 'Instant'
+                  ? (() => {
+                      if (payNum <= 0) return token === 'FFC' ? '0.50%–1.00%' : '0.10%–0.50%';
+                      if (token === 'FFC') {
+                        const fee = Math.min(1.00, Math.max(0.50, 0.50 + 0.50 * (payNum / 2_400_000)));
+                        return \`\${fee.toFixed(2)}%\`;
+                      }
+                      const fee = Math.min(0.50, Math.max(0.10, 0.10 + 0.40 * (payNum / 13_581_107)));
+                      return \`\${fee.toFixed(2)}%\`;
+                    })()
+                  : (token === 'FFC' ? 'Within 90 days' : 'Within 30 days')}
+              </span>
+            </div>
+            <div style={{ fontSize: 12.5, color: 'var(--fleets-fg-50)', marginTop: 8, lineHeight: 1.45 }}>
+              {redeemMode === 'Instant'
+                ? (token === 'FFC'
+                    ? 'Fee scales 0.50%–1.00% based on redemption size vs. available liquidity.'
+                    : 'Fee scales 0.10%–0.50% based on redemption size vs. available liquidity ($13,581,107 pool).')
+                : (token === 'FFC'
+                    ? 'Scheduled redemptions are processed within 90 days with no fee.'
+                    : 'Scheduled redemptions are processed within 30 days with no fee.')}
+            </div>
+          </>
+        )}`,
+  proposed: `        {!isMint && (
+          <>
+            <div style={{ marginTop: 14 }}>
+              <Segmented options={['Instant', 'Scheduled']} value={redeemMode} onChange={setRedeemMode} />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13.5, marginTop: 14 }}>
+              <span style={{ color: 'var(--fleets-fg-50)' }}>
+                {redeemMode === 'Instant' ? 'Redemption Fee' : 'Processing'}
+              </span>
+              <span style={{ color: 'var(--fleets-fg-80)', fontWeight: 500, fontVariantNumeric: 'tabular-nums' }}>
+                {redeemMode === 'Instant'
+                  ? (() => {
+                      // CHANGED (round 2) — elbTrancheUsd/feeBpsMin/feeBpsMax now
+                      // come from liquidity.redeemable_instantly on the overview
+                      // API (real, live), not two constants frozen at whatever
+                      // the pool looked like when someone hardcoded them.
+                      const { elbTrancheUsd, feeBpsMin, feeBpsMax } = liquidityForToken(token);
+                      if (payNum <= 0 || elbTrancheUsd <= 0) return \`\${(feeBpsMin / 100).toFixed(2)}%–\${(feeBpsMax / 100).toFixed(2)}%\`;
+                      if (payNum > elbTrancheUsd) return 'Exceeds instant liquidity';
+                      const feeBps = feeBpsMin + (feeBpsMax - feeBpsMin) * (payNum / elbTrancheUsd);
+                      return \`\${(feeBps / 100).toFixed(2)}%\`;
+                    })()
+                  : (token === 'FFC' ? 'Within 90 days' : 'Within 30 days')}
+              </span>
+            </div>
+            <div style={{ fontSize: 12.5, color: 'var(--fleets-fg-50)', marginTop: 8, lineHeight: 1.45 }}>
+              {redeemMode === 'Instant'
+                ? (() => {
+                    const { elbTrancheUsd, feeBpsMin, feeBpsMax } = liquidityForToken(token);
+                    return \`Fee scales \${(feeBpsMin / 100).toFixed(2)}%–\${(feeBpsMax / 100).toFixed(2)}% based on redemption size vs. available liquidity (\${fmtNum(elbTrancheUsd)} available now).\`;
+                  })()
+                : (token === 'FFC' ? 'Scheduled redemptions are processed within 90 days with no fee.'
+                                    : 'Scheduled redemptions are processed within 30 days with no fee.')}
+            </div>
+          </>
+        )}`,
+  suggestions: [
+    "liquidityForToken(token) is assumed here to read from whatever hook already loads this card's overview data — not shown in this excerpt since the component's full data-fetching setup is out of scope for a targeted diff. If no such hook exists yet, one needs adding alongside this change, not just the formula swap.",
+    "The redeem CTA itself is still gated ('Redeem — Coming soon', further up this file) — this diff only makes the FEE PREVIEW real. Actually enabling the button needs a client-side transaction-building call to accelerated_redeem/submit_redemption, which doesn't exist on the frontend at all yet — a separate, larger piece of work than this preview fix.",
+  ],
 },
 ];

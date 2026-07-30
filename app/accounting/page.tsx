@@ -60,12 +60,18 @@ export default function AccountingPage() {
             <strong>Why this is fine:</strong> the borrower&rsquo;s payment is identical either way — same cash,
             every period, regardless of which schedule is doing the labeling.{' '}
             <code>
-              FLP total value = USDY reserve (real, liquid) + outstanding_principal (internal accounting — a
-              number the books assume is there, not cash sitting anywhere) − realized losses.
+              FLP total value = yield-bearing reserve (real, liquid — USDY, syrupUSDC, or any other registered
+              source) + outstanding_principal (internal accounting — a number the books assume is there, not
+              cash sitting anywhere).
             </code>{' '}
-            Since the full payment lands in the pool as reserve either way, switching which schedule{' '}
-            <code>outstanding_principal</code> follows doesn&rsquo;t change how much money is ever actually in
-            the pool — only how the books narrate getting there.
+            Deliberately no <code>− realized_losses</code> term here — that already double-subtracts a default
+            in the real contract&rsquo;s <code>compute_v_pool</code>: <code>approve_default.rs</code> reduces{' '}
+            <code>outstanding_principal</code> by the defaulted loan&rsquo;s balance <em>and</em> separately grows{' '}
+            <code>realized_losses</code> by the same loss, so subtracting it again on top of the already-shrunk{' '}
+            <code>outstanding_principal</code> counts that loss twice. See <code>/open-questions</code> — flagged
+            there, not fixed in this round. Since the full payment lands in the pool as reserve either way,
+            switching which schedule <code>outstanding_principal</code> follows doesn&rsquo;t change how much
+            money is ever actually in the pool — only how the books narrate getting there.
           </Callout>
         </div>
 

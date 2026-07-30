@@ -96,8 +96,9 @@ new_tokens   = usd_value / $1                  // new tranche starts at exactly 
             beyond what the loss already destroyed.
           </p>
           <p style={{ marginTop: 12 }}>
-            Crucially, this touches only FFC&rsquo;s own accounting. The pool&rsquo;s real assets — the USDY
-            reserve, the outstanding loan book — aren&rsquo;t moved, split, or re-valued by this at all. FYC&rsquo;s
+            Crucially, this touches only FFC&rsquo;s own accounting. The pool&rsquo;s real assets — the
+            yield-bearing reserve(s), the outstanding loan book — aren&rsquo;t moved, split, or re-valued by
+            this at all. FYC&rsquo;s
             <code> TrancheState</code> is untouched. This is a re-labeling of FFC&rsquo;s claim structure, not a
             change to what backs it.
           </p>

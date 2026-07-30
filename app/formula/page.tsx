@@ -13,7 +13,10 @@ export default function FormulaPage() {
         <CodeBlock
           fontSize={12.8}
           code={`// at origination (once) — instructions/originate_loan.rs
-// monthly_payment is unchanged: the borrower's real, level payment
+// monthly_payment itself is unchanged BY THIS ROUND — still the borrower's
+// real, level payment. Its internal day-count convention gets a separate
+// fix in the redemption/liquidity round (/12 -> PERIODS_PER_YEAR ≈ /12.1667,
+// since a period is 30 days, not a calendar month) — see /glossary#periods-per-year.
 monthly_payment    = compute_monthly_payment(principal, apr_bps, term_months)
 // new — stored on LoanAccount, drives the pool's own books from here on
 levelized_interest = (monthly_payment × term_months − principal) / term_months

@@ -15,10 +15,39 @@
  */
 
 // ---------------------------------------------------------------------------
-// Constants — every one of these is a stored, tunable protocol parameter.
-// Values marked "illustrative" have not been signed off; see /open-questions
-// equivalent callouts throughout the app.
+// Time — the ONE place SECONDS_PER_PERIOD/SECONDS_PER_YEAR are defined.
+// Previously duplicated in lib/simulate.ts as a separate copy; moved here so
+// amortization (below) and yield annualization (lib/simulate.ts, which now
+// imports these) can never silently drift onto two different definitions of
+// "how many periods in a year" — see the PERIODS_PER_YEAR note and
+// /open-questions for the real bug this fixes.
 // ---------------------------------------------------------------------------
+
+export const SECONDS_PER_DAY = 86_400;
+/** Every repayment/epoch period is a fixed 30 days — SECONDS_PER_PERIOD in
+ * the real contract — never a calendar month. */
+export const SECONDS_PER_PERIOD = 30 * SECONDS_PER_DAY;
+export const SECONDS_PER_YEAR = 365 * SECONDS_PER_DAY;
+/** Periods per year, EXACT — 365/30 ≈ 12.1667, not a flat 12. A 30-day
+ * period is not 1/12 of a 365-day year (12 periods is only 360 days), so
+ * treating it as one silently overstates every per-period rate relative to
+ * its stated annual figure once actually annualized. This constant is used
+ * for BOTH loan-interest amortization (below) and yield-source APY
+ * annualization (lib/simulate.ts) — before this fix, amortization used a
+ * hardcoded /12 (implicitly a 30/360 day-count) while yield annualization
+ * already used this exact 365-day figure, a real, confirmed inconsistency:
+ * the real contract's compute_monthly_payment/period_interest (mirrors
+ * helpers/amortization.rs) both hardcode "/ 12", while
+ * observed_source_apy_bps already annualizes against a real 365-day year.
+ * A stated "15% APR" loan was actually costing borrowers ~15.21% once
+ * measured against a true calendar year (15% × 12.1667/12) — small
+ * (≈1.4% relative), systematic, and asymmetric with the yield side's own
+ * convention. Fixed here by using this SAME constant everywhere a period
+ * gets annualized or de-annualized, loan interest included. See
+ * /open-questions for the alternative (30/360 is also a common, legitimate
+ * day-count convention) — this wasn't an obvious bug so much as a choice
+ * nobody had made consistently yet. */
+export const PERIODS_PER_YEAR = SECONDS_PER_YEAR / SECONDS_PER_PERIOD;
 
 /** Fee taken off gross yield before any tranche split. 15% fee / 85% net. */
 export const NET_YIELD_FRACTION = 0.85;
@@ -348,17 +377,29 @@ export function distributeLoanInterest(pool: Pool, grossInterest: number): Distr
  * M = -----------------------------
  *      1 − (1 + r)^(−n)
  * ```
- * `r` = monthly rate (APR / 12), `n` = term in months (30-day periods).
+ * `r` = per-period rate (APR / PERIODS_PER_YEAR ≈ APR / 12.1667), `n` =
+ * term in 30-day periods — despite the parameter name `termMonths`
+ * (inherited as-is from the real contract's own `term_months` field name;
+ * it counts periods, not calendar months — see /open-questions). Fixed
+ * (round 2) from a hardcoded `/ 12`: that divisor implicitly treated each
+ * 30-day period as exactly 1/12 of a year (a 30/360 day-count), which
+ * doesn't match this same file's own yield-annualization convention
+ * (365-day, ACT/365 — see PERIODS_PER_YEAR). The old math wasn't
+ * "wrong" in isolation — 30/360 is a legitimate, common convention — it
+ * was just inconsistent with the OTHER convention already in use one
+ * function away. Using PERIODS_PER_YEAR everywhere closes that gap: a
+ * stated 15% APR loan now actually costs 15% annualized, not ~15.21%.
  */
 export function monthlyPayment(principal: number, aprAnnual: number, termMonths: number): number {
-  const r = aprAnnual / 12;
+  const r = aprAnnual / PERIODS_PER_YEAR;
   if (r === 0) return principal / termMonths;
   return (principal * r) / (1 - Math.pow(1 + r, -termMonths));
 }
 
-/** period_interest — true, declining-balance interest for one period. */
+/** period_interest — true, declining-balance interest for one period. Same
+ * PERIODS_PER_YEAR fix as monthlyPayment above — was a hardcoded /12. */
 export function periodInterest(balance: number, aprAnnual: number): number {
-  return (balance * aprAnnual) / 12;
+  return (balance * aprAnnual) / PERIODS_PER_YEAR;
 }
 
 /** Total interest paid over the life of the loan, and its levelized
@@ -426,13 +467,263 @@ export function buildOldModelSchedule(
   let bal = principal;
   for (let k = 1; k <= termMonths; k++) {
     const interest = periodInterest(bal, aprAnnual);
-    bal = bal * (1 + aprAnnual / 12) - m;
+    bal = bal * (1 + aprAnnual / PERIODS_PER_YEAR) - m;
     const netYield = interest * NET_YIELD_FRACTION;
     const fycShare = Math.min(fycMonthlyTarget, netYield);
     const ffcShare = Math.max(0, netYield - fycShare);
     rows.push({ period: k, netYield, fycShare, ffcShare });
   }
   return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Redemption liquidity — ELB (idle/undeployed reserve) and its tranche split.
+// Second design round — see /redemption, /tranche-swap, /yield-sources.
+// ---------------------------------------------------------------------------
+
+/** RESERVE_TARGET_FRACTION — the "20% always stays as reserve" floor. Not an
+ * independently-enforced gate: it's the algebraic complement of
+ * ALLOCATION_CEILING_FRACTION (loans can be at most 80% of V_pool), so it's
+ * already guaranteed by the existing allocation ceiling. Named here purely
+ * so /glossary and /latex can cite it as its own concept. */
+export const RESERVE_TARGET_FRACTION = 1 - ALLOCATION_CEILING_FRACTION;
+
+export interface Elb {
+  elbTotal: number;
+  elbFyc: number;
+  elbFfc: number;
+}
+
+/**
+ * ELB — "Excess Liquidity Balance," the pool's idle capital sitting in a
+ * yield-bearing reserve token, not deployed as loans. Split pro-rata by each
+ * tranche's share of the combined pool — the same flat pool-share formula
+ * splitBaseYieldTokenYield already uses for reserve *yield*, applied here to
+ * reserve *capital* instead.
+ *
+ * ```txt
+ *                    V_tranche
+ * elb_tranche = ELB × ----------
+ *                     FYC + FFC
+ * ```
+ */
+export function splitElb(elbTotal: number, fyc: number, ffc: number): Elb {
+  const pool = fyc + ffc;
+  if (pool <= 0 || elbTotal <= 0) return { elbTotal: Math.max(0, elbTotal), elbFyc: 0, elbFfc: 0 };
+  const elbFyc = (elbTotal * fyc) / pool;
+  return { elbTotal, elbFyc, elbFfc: elbTotal - elbFyc };
+}
+
+// ---------------------------------------------------------------------------
+// Instant (accelerated) redemption — fee scales with how much of that
+// tranche's available instant liquidity a redemption consumes.
+// ---------------------------------------------------------------------------
+
+export type Tranche = 'fyc' | 'ffc';
+
+/** [fee_min_bps, fee_max_bps] per tranche. FFC's band sits strictly above
+ * FYC's — junior liquidity is scarcer and riskier to hand out on demand. */
+export const INSTANT_FEE_BPS: Record<Tranche, [number, number]> = {
+  fyc: [10, 50], // 0.10% – 0.50%
+  ffc: [50, 100], // 0.50% – 1.00%
+};
+
+export interface InstantFeeResult {
+  allowed: boolean;
+  feeBps: number;
+  feeValue: number;
+  netPayout: number;
+}
+
+/**
+ * Instant-redemption fee — the ENDPOINT-RATE formula, as specified: the fee
+ * rate charged on the WHOLE redemption is read off where the amount lands
+ * within the tranche's available instant liquidity, then applied flat to
+ * the full amount.
+ *
+ * ```txt
+ *                                amount
+ * fee_bps = fee_min + ------------------------------ × (fee_max − fee_min)
+ *                          elb_tranche
+ * ```
+ *
+ * Worked example (the one this was specified against): $40K ELB_FYC,
+ * redeeming $20K (the midpoint) lands fee_bps at the midpoint of [10, 50] —
+ * 30 bps.
+ *
+ * NOTE — split-gameable, deliberately not fixed here: because elb_tranche is
+ * read live, splitting one large redemption into several smaller ones (in
+ * one transaction, before anything else can move elb_tranche) converges the
+ * *average* rate paid toward fee_min. The split-invariant fix is the closed-
+ * form integral of this same marginal rate over [0, amount] —
+ * `fee = fee_min·amount + (fee_max−fee_min)·amount²/(2·elb_tranche)`, exactly
+ * half the quadratic term this endpoint formula charges. That variant is
+ * recommended for production but changes this worked example's numbers, so
+ * it isn't silently substituted here — see /open-questions.
+ *
+ * Redeeming more than the tranche's available instant liquidity isn't
+ * discounted or partially served — it's simply not eligible for the instant
+ * path at all; the only route for that amount is the 30d/90d scheduled queue.
+ */
+export function instantRedemptionFeeBps(tranche: Tranche, amount: number, elbTranche: number): InstantFeeResult {
+  const [min, max] = INSTANT_FEE_BPS[tranche];
+  if (amount <= 0 || elbTranche <= 0 || amount > elbTranche) {
+    return { allowed: false, feeBps: 0, feeValue: 0, netPayout: 0 };
+  }
+  const feeBps = min + (amount / elbTranche) * (max - min);
+  const feeValue = (amount * feeBps) / 10_000;
+  return { allowed: true, feeBps, feeValue, netPayout: amount - feeValue };
+}
+
+// ---------------------------------------------------------------------------
+// jr_to_sr / sr_to_jr — the tranche-conversion primitive. Burns one tranche's
+// tokens, mints the other's, at CONSERVATIVE price on both legs — this moves
+// already-collected value, not new external capital, so optimistic price's
+// dilution-protection purpose doesn't apply; using it here would under-mint
+// the destination tranche and hand existing holders a NAV bump for free.
+// ---------------------------------------------------------------------------
+
+export type ConvertDirection = 'jrToSr' | 'srToJr';
+
+export interface ConvertResult {
+  valueUsd: number;
+  tokensBurned: number;
+  tokensMinted: number;
+}
+
+/** Burns `tokensIn` of the source tranche at its own conservative price and
+ * mints the equivalent USD value of the destination tranche at ITS
+ * conservative price. V_pool is unchanged by construction — value moves
+ * between tranches, none is invented or destroyed. */
+export function convertTranche(
+  direction: ConvertDirection,
+  tokensIn: number,
+  fycPrice: number,
+  ffcPrice: number,
+): ConvertResult {
+  const srcPrice = direction === 'jrToSr' ? ffcPrice : fycPrice;
+  const destPrice = direction === 'jrToSr' ? fycPrice : ffcPrice;
+  const valueUsd = tokensIn * srcPrice;
+  const tokensMinted = destPrice > 0 ? valueUsd / destPrice : 0;
+  return { valueUsd, tokensBurned: tokensIn, tokensMinted };
+}
+
+// ---------------------------------------------------------------------------
+// Redemption-fee collection — always settles as FYC in the two fee wallets.
+// ---------------------------------------------------------------------------
+
+export interface FeeSplitResult {
+  /** USD value attributed to each wallet — always feeValue/2, regardless of
+   * which tranche the fee was taken from (only the MECHANISM by which it
+   * becomes FYC differs, never the 50/50 split itself). */
+  protocolValueUsd: number;
+  insuranceValueUsd: number;
+  /** Nonzero only for an FFC-sourced fee: how much FFC was burned, and how
+   * much new FYC was minted to cover it (via convertTranche). Both zero for
+   * an FYC-sourced fee, since those tokens are transferred, never burned. */
+  ffcTokensBurned: number;
+  fycTokensMinted: number;
+}
+
+/**
+ * Splits a redemption fee 50/50 between protocol_wallet and insurance_wallet
+ * — always settled as FYC. Redeeming FYC: the fee-portion tokens are simply
+ * never burned, just transferred (protocol/insurance treasuries end up
+ * holding FYC they were always going to hold anyway) — v_fyc/fyc_supply
+ * don't move at all for this leg. Redeeming FFC: the fee-portion tokens ARE
+ * burned (via convertTranche('jrToSr', ...)) and the equivalent value is
+ * minted as new FYC instead — deliberately asymmetric with the FYC case:
+ * protocol/insurance treasuries should never carry first-loss (FFC)
+ * exposure, so junior-side fees are always converted up to senior before
+ * they land in a wallet.
+ */
+export function instantRedemptionFeeSplit(
+  tranche: Tranche,
+  feeValue: number,
+  fycPrice: number,
+  ffcPrice: number,
+): FeeSplitResult {
+  const half = feeValue / 2;
+  if (tranche === 'fyc') {
+    return { protocolValueUsd: half, insuranceValueUsd: half, ffcTokensBurned: 0, fycTokensMinted: 0 };
+  }
+  const feeFfcTokens = ffcPrice > 0 ? feeValue / ffcPrice : 0;
+  const { tokensMinted } = convertTranche('jrToSr', feeFfcTokens, fycPrice, ffcPrice);
+  return { protocolValueUsd: half, insuranceValueUsd: half, ffcTokensBurned: feeFfcTokens, fycTokensMinted: tokensMinted };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-yield-source targeting — blended portfolio APY and rebalance routing.
+// ---------------------------------------------------------------------------
+
+/** Target band for the pool's BLENDED yield across every enabled yield
+ * source. `min` exists purely so "couldn't reach the target" is never an
+ * error — it's the point at which the routing logic stops caring, not a
+ * hard requirement. `max` is a soft ceiling too: overshooting it is fine,
+ * the routing logic will still reach for it. */
+export const YIELD_TARGET = { min: 0.03, target: 0.035, max: 0.07 };
+
+export interface YieldSource {
+  id: string;
+  capitalUsd: number;
+  apy: number;
+  enabled: boolean;
+}
+
+/**
+ * Blended portfolio APY — capital-weighted average across every source.
+ * Structurally identical to Hylo's published "Average SOL Reserve Yield"
+ * equation (Σ(supply×price×apy) / total reserve); ours weights by USD
+ * capital directly since each source already reports its own USD value.
+ *
+ * ```txt
+ *              Σ (capital_i × apy_i)
+ * blended_apy = ----------------------
+ *                   Σ capital_i
+ * ```
+ */
+export function blendedApy(sources: YieldSource[]): number {
+  const enabled = sources.filter((s) => s.enabled);
+  const total = enabled.reduce((s, x) => s + x.capitalUsd, 0);
+  if (total <= 0) return 0;
+  return enabled.reduce((s, x) => s + x.capitalUsd * x.apy, 0) / total;
+}
+
+export interface RebalanceChoice {
+  sourceId: string | null;
+  resultingApy: number;
+  inRange: boolean;
+}
+
+/**
+ * Picks which ENABLED source new capital should route into. Scores every
+ * candidate by the blended APY the pool would have right after routing
+ * `depositAmount` into it; prefers whichever lands closest to
+ * YIELD_TARGET.target among candidates that land inside [min, max]. If none
+ * land in range, prefers the single highest resulting APY instead of
+ * failing — undershooting forever is the failure mode this guards against,
+ * not overshooting.
+ */
+export function pickRebalanceTarget(sources: YieldSource[], depositAmount: number): RebalanceChoice {
+  const enabled = sources.filter((s) => s.enabled);
+  if (enabled.length === 0) return { sourceId: null, resultingApy: 0, inRange: false };
+
+  const scored = enabled.map((candidate) => {
+    const hypothetical = sources.map((s) =>
+      s.id === candidate.id ? { ...s, capitalUsd: s.capitalUsd + depositAmount } : s,
+    );
+    return { id: candidate.id, resultingApy: blendedApy(hypothetical) };
+  });
+
+  const inRange = scored.filter((s) => s.resultingApy >= YIELD_TARGET.min && s.resultingApy <= YIELD_TARGET.max);
+  if (inRange.length > 0) {
+    const best = inRange.reduce((a, b) =>
+      Math.abs(a.resultingApy - YIELD_TARGET.target) <= Math.abs(b.resultingApy - YIELD_TARGET.target) ? a : b,
+    );
+    return { sourceId: best.id, resultingApy: best.resultingApy, inRange: true };
+  }
+  const highest = scored.reduce((a, b) => (a.resultingApy >= b.resultingApy ? a : b));
+  return { sourceId: highest.id, resultingApy: highest.resultingApy, inRange: false };
 }
 
 // ---------------------------------------------------------------------------

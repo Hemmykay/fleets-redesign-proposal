@@ -61,7 +61,7 @@ function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-const NOTE_LINE_RE = /^\/\/!?\s?/;
+const NOTE_LINE_RE = /^\/\/[\/!]?\s?/;
 
 /** For each line in a proposed file, find the explanatory comment block
  * that already precedes it (every `// NEW —` / `// CHANGED —` note authored
@@ -85,7 +85,12 @@ export function extractLineNotes(lines: string[]): (string | null)[] {
       const isExplanatory = /^(NEW|CHANGED)\b/i.test(text) || text.length > 40;
       if (isExplanatory) {
         for (let j = start; j < i; j++) notes[j] = text;
+        // A banner-style comment (e.g. a "--- Foo — NEW ... ---" block) is
+        // often followed by ONE blank separator line before the actual
+        // item — skip past it rather than stopping there, or the code the
+        // comment is describing gets no tooltip at all.
         let k = i;
+        while (k < lines.length && lines[k].trim() === '') k++;
         while (k < lines.length && lines[k].trim() !== '' && !NOTE_LINE_RE.test(lines[k].trim())) {
           notes[k] = text;
           k++;

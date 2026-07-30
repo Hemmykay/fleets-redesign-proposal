@@ -3,7 +3,7 @@
 import { useMemo, useState } from 'react';
 import LineChart from '@/components/LineChart';
 import { PageHeader, SectionHead, Card, Readout, Callout } from '@/components/ui';
-import { NET_YIELD_FRACTION, periodInterest, monthlyPayment, fmtUSD2 } from '@/lib/model';
+import { NET_YIELD_FRACTION, PERIODS_PER_YEAR, periodInterest, monthlyPayment, fmtUSD2 } from '@/lib/model';
 
 const LOAN_P = 100000;
 const LOAN_APR = 0.15;
@@ -15,7 +15,7 @@ function buildRows(target: number) {
   const rows: { month: number; netYield: number; fycShare: number; ffcShare: number }[] = [];
   for (let k = 1; k <= LOAN_N; k++) {
     const interest = periodInterest(bal, LOAN_APR);
-    bal = bal * (1 + LOAN_APR / 12) - m;
+    bal = bal * (1 + LOAN_APR / PERIODS_PER_YEAR) - m;
     const netYield = interest * NET_YIELD_FRACTION;
     const fycShare = Math.min(target, netYield);
     const ffcShare = Math.max(0, netYield - fycShare);

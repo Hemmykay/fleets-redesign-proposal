@@ -10,6 +10,7 @@ import {
   SEVERITY_REF,
   ALLOCATION_CEILING_FRACTION,
   NET_YIELD_FRACTION,
+  PERIODS_PER_YEAR,
   coverageOf,
   severityOf,
   curveAtActual,
@@ -34,7 +35,7 @@ export default function ExplorerPage() {
   const [fyc, setFyc] = useState(600000);
   const [ffc, setFfc] = useState(400000);
   const [out, setOut] = useState(450000);
-  const [reserveApy, setReserveApy] = useState(2.8);
+  const [reserveApy, setReserveApy] = useState(3.5);
   const [loanApr, setLoanApr] = useState(15);
   // Shared override of SEVERITY_GATE_MAX — set here, but also read by the
   // simulator (via SeverityGateProvider in the root layout), so exploring a
@@ -69,22 +70,26 @@ export default function ExplorerPage() {
   // interest (curve-split), combined and annualized, exactly like one period
   // of the time-stepped simulator but computed instantly off the sliders.
   const reserve = Math.max(0, fyc + ffc - out);
-  const reserveGrossYield = (reserve * (reserveApy / 100)) / 12;
+  // Divides/re-multiplies by PERIODS_PER_YEAR (≈12.1667), not a flat 12 — a
+  // period is 30 days, not a calendar month, so this now matches both the
+  // fixed amortization math above (see monthlyPayment) and the simulator's
+  // own annualization, instead of quietly disagreeing with both by ~1.4%.
+  const reserveGrossYield = (reserve * (reserveApy / 100)) / PERIODS_PER_YEAR;
   const reserveNetYield = reserveGrossYield * NET_YIELD_FRACTION;
   const reserveSplit = splitBaseYieldTokenYield(reserveNetYield, fyc, ffc);
   const loanGrossInterest = levelizedInterest(out, loanApr / 100, TERM_MONTHS);
   const loanDist = distributeLoanInterest({ fyc, ffc, outstanding: out }, loanGrossInterest);
   const fycMonthlyYield = reserveSplit.fycShare + loanDist.fycShare;
   const ffcMonthlyYield = reserveSplit.ffcShare + loanDist.ffcShare;
-  const fycApy = fyc > 0 ? (fycMonthlyYield / fyc) * 12 * 100 : 0;
-  const ffcApy = ffc > 0 ? (ffcMonthlyYield / ffc) * 12 * 100 : 0;
-  // Platform APY — the same combined USDY + loan yield, but relative to the
+  const fycApy = fyc > 0 ? (fycMonthlyYield / fyc) * PERIODS_PER_YEAR * 100 : 0;
+  const ffcApy = ffc > 0 ? (ffcMonthlyYield / ffc) * PERIODS_PER_YEAR * 100 : 0;
+  // Platform APY — the same combined reserve + loan yield, but relative to the
   // whole pool (FYC + FFC) rather than either tranche alone. This is just
   // the size-weighted average of the two APYs above — the split moves money
   // between tranches, it doesn't create or destroy any of it.
   const totalTvl = fyc + ffc;
   const platformMonthlyYield = fycMonthlyYield + ffcMonthlyYield;
-  const platformApy = totalTvl > 0 ? (platformMonthlyYield / totalTvl) * 12 * 100 : 0;
+  const platformApy = totalTvl > 0 ? (platformMonthlyYield / totalTvl) * PERIODS_PER_YEAR * 100 : 0;
 
   // Max loan allowed right now — whichever of the two independent ceilings
   // (severity gate, 80% allocation ceiling) leaves less headroom above the
@@ -141,8 +146,8 @@ export default function ExplorerPage() {
       const sweptCurve = curveAtSwept(c, ffc, fyc);
       const ffcShare = net * sweptCurve.share;
       const fycShare = net - ffcShare;
-      fycPts.push({ x: c, y: fyc > 0 ? (fycShare / fyc) * 12 * 100 : 0 });
-      ffcPts.push({ x: c, y: ffc > 0 ? (ffcShare / ffc) * 12 * 100 : 0 });
+      fycPts.push({ x: c, y: fyc > 0 ? (fycShare / fyc) * PERIODS_PER_YEAR * 100 : 0 });
+      ffcPts.push({ x: c, y: ffc > 0 ? (ffcShare / ffc) * PERIODS_PER_YEAR * 100 : 0 });
     }
     return { fycPts, ffcPts };
   }, [ffc, fyc, loanApr]);
@@ -260,7 +265,7 @@ export default function ExplorerPage() {
                 step={1}
                 onChange={setSeverityGateMax}
               />
-              <PercentSlider label="Reserve/USDY APY" value={reserveApy} min={0} max={10} step={0.1} onChange={setReserveApy} />
+              <PercentSlider label="Reserve/yield-token APY" value={reserveApy} min={0} max={10} step={0.1} onChange={setReserveApy} />
               <PercentSlider label="Representative loan APR (3-yr term)" value={loanApr} min={1} max={30} step={0.5} onChange={setLoanApr} />
             </div>
 

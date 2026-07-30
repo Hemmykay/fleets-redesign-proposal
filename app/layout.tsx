@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import './globals.css';
+import 'katex/dist/katex.min.css';
 import Sidebar from '@/components/Sidebar';
 import { SeverityGateProvider } from '@/components/SeverityGateContext';
 import { SimulatorStateProvider } from '@/components/SimulatorStateContext';

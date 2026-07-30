@@ -29,7 +29,7 @@ export default function ChangesPage() {
             </h3>
             <ul className="diff-list unchanged">
               <Item
-                b={<><b>Reserve/USDY yield split.</b> Stays flat pro-rata by tranche size — the curve applies only to loan interest.</>}
+                b={<><b>Reserve/yield-token yield split.</b> Stays flat pro-rata by tranche size — the curve applies only to loan interest.</>}
                 file="helpers/waterfall.rs — split_base_yield_token_yield"
               />
               <Item

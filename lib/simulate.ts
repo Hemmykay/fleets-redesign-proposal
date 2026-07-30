@@ -8,13 +8,18 @@
  * contract's observed_source_apy_bps does — 365-day years, not a flat ×12 —
  * so 12 periods add up to 360 days, not 365, and PERIODS_PER_YEAR is
  * ~12.1667, not 12. Every place a rate gets annualized or de-annualized
- * uses this same constant, so nothing here silently drifts against the
- * real contract's own math.
+ * uses this same constant (imported from lib/model.ts, the single source of
+ * truth — amortization uses the identical constant now too, see
+ * monthlyPayment's doc comment), so nothing here silently drifts against
+ * the real contract's own math, or against this file's own loan schedule.
  */
 
 import {
   NET_YIELD_FRACTION,
   K_MIN,
+  SECONDS_PER_PERIOD,
+  SECONDS_PER_YEAR,
+  PERIODS_PER_YEAR,
   assertMintAllowed,
   assertOriginationAllowed,
   levelizedInterest,
@@ -23,15 +28,19 @@ import {
   coverageOf,
   splitBaseYieldTokenYield,
   distributeLoanInterest,
+  splitElb,
+  instantRedemptionFeeBps,
+  instantRedemptionFeeSplit,
+  type Tranche,
 } from './model';
 
-const SECONDS_PER_DAY = 86_400;
-export const SECONDS_PER_PERIOD = 30 * SECONDS_PER_DAY;
-export const SECONDS_PER_YEAR = 365 * SECONDS_PER_DAY;
-/** Exact periods-per-year — matches observed_source_apy_bps's own
- * annualization factor. 12 thirty-day periods is 360 days, not 365, so this
- * is ~12.1667, not 12. */
-export const PERIODS_PER_YEAR = SECONDS_PER_YEAR / SECONDS_PER_PERIOD;
+export { SECONDS_PER_PERIOD, SECONDS_PER_YEAR, PERIODS_PER_YEAR };
+
+/** FYC_REDEMPTION_LOCK_SECS / FFC_REDEMPTION_LOCK_SECS (30d / 90d) expressed
+ * in whole 30-day periods — exact, since both locks are multiples of
+ * SECONDS_PER_PERIOD. A scheduled redemption submitted at period P becomes
+ * eligible at period P + this many periods. */
+export const LOCK_PERIODS: Record<Tranche, number> = { fyc: 1, ffc: 3 };
 
 export interface OriginationEvent {
   id: string;
@@ -60,6 +69,25 @@ export interface TrancheActivityEvent {
   tranche: 'fyc' | 'ffc';
   kind: 'mint' | 'redeem';
   amount: number;
+  /** Redeem only. 'instant' (default when unset) draws on that tranche's
+   * available instant liquidity (ELB minus pending/earmarked draws) at the
+   * liquidity-scaled fee — see instantRedemptionFeeBps. 'scheduled' queues
+   * the redemption for LOCK_PERIODS (1 for FYC, 3 for FFC) and pays out at
+   * the price on the period it matures, no fee — the existing 30d/90d
+   * queue. Ignored for mint events. */
+  mode?: 'instant' | 'scheduled';
+}
+
+/** A loan reaching the off-chain "equity received" pipeline stage earmarks
+ * its capital out of the reserve before it actually originates on-chain, so
+ * it can't be instantly redeemed out from under the loan. 'release' fires
+ * either when the loan actually originates (capital moves into
+ * `outstanding`) or the deal falls through (cancel_earmark). */
+export interface EarmarkEvent {
+  id: string;
+  period: number;
+  amount: number;
+  kind: 'earmark' | 'release';
 }
 
 export interface ScenarioConfig {
@@ -82,6 +110,9 @@ export interface ScenarioConfig {
    * to the stored constant. Lets the simulator pick up the same "what if
    * the gate were X" value explored on /explorer. */
   severityGateMax?: number;
+  /** Capital reserved against equity-received-but-not-yet-originated loans —
+   * see EarmarkEvent. Defaults to none. */
+  earmarkEvents?: EarmarkEvent[];
 }
 
 interface ActiveLoan {
@@ -97,7 +128,16 @@ interface ActiveLoan {
 
 export interface SimEvent {
   period: number;
-  kind: 'origination' | 'origination-blocked' | 'default' | 'mint' | 'mint-blocked' | 'redeem';
+  kind:
+    | 'origination'
+    | 'origination-blocked'
+    | 'default'
+    | 'mint'
+    | 'mint-blocked'
+    | 'redeem'
+    | 'redeem-blocked'
+    | 'redeem-scheduled'
+    | 'redeem-processed';
   detail: string;
 }
 
@@ -136,6 +176,26 @@ export interface SimStep {
   fycLoss: number;
   ffcLoss: number;
   activeLoanCount: number;
+  /** Idle reserve (pool minus outstanding minus earmarked capital) and its
+   * pro-rata tranche split — see splitElb. */
+  elbTotal: number;
+  elbFyc: number;
+  elbFfc: number;
+  /** Sum of not-yet-matured scheduled (30d/90d queue) redemptions per
+   * tranche — netted out of elbFyc/elbFfc before an instant redemption is
+   * evaluated, so a queued redeemer can't be stranded by one paid instantly
+   * out from under them. */
+  pendingFyc: number;
+  pendingFfc: number;
+  /** Capital reserved against loans that reached "equity received" but
+   * haven't originated on-chain yet — see EarmarkEvent. */
+  earmarkedCapital: number;
+  /** This period's redemption-fee revenue, always settled as FYC, split
+   * 50/50 — see instantRedemptionFeeSplit. */
+  protocolFeeFyc: number;
+  insuranceFeeFyc: number;
+  protocolFeeFycCum: number;
+  insuranceFeeFycCum: number;
 }
 
 export interface SimResult {
@@ -152,6 +212,12 @@ export function runSimulation(config: ScenarioConfig): SimResult {
   let loans: ActiveLoan[] = [];
   let fycCumYield = 0;
   let ffcCumYield = 0;
+
+  // Redemption liquidity state — see /redemption.
+  let pendingQueue: { tranche: Tranche; amount: number; requestPeriod: number; eligiblePeriod: number }[] = [];
+  let earmarkedCapital = 0;
+  let protocolFeeFycCum = 0;
+  let insuranceFeeFycCum = 0;
 
   // Token supply — set at genesis so price starts at exactly $1.00, then
   // mutated by mint/redeem events. The 15% fee mint into FYC is price-neutral
@@ -183,6 +249,12 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     const arr = activityByPeriod.get(a.period) ?? [];
     arr.push(a);
     activityByPeriod.set(a.period, arr);
+  }
+  const earmarkEventsByPeriod = new Map<number, EarmarkEvent[]>();
+  for (const e of config.earmarkEvents ?? []) {
+    const arr = earmarkEventsByPeriod.get(e.period) ?? [];
+    arr.push(e);
+    earmarkEventsByPeriod.set(e.period, arr);
   }
 
   // period 0 — initial snapshot, before anything happens
@@ -221,6 +293,16 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     fycLoss: 0,
     ffcLoss: 0,
     activeLoanCount: 0,
+    elbTotal: fyc + ffc,
+    elbFyc: splitElb(fyc + ffc, fyc, ffc).elbFyc,
+    elbFfc: splitElb(fyc + ffc, fyc, ffc).elbFfc,
+    pendingFyc: 0,
+    pendingFfc: 0,
+    earmarkedCapital: 0,
+    protocolFeeFyc: 0,
+    insuranceFeeFyc: 0,
+    protocolFeeFycCum: 0,
+    insuranceFeeFycCum: 0,
   });
 
   for (let period = 1; period <= config.periods; period++) {
@@ -241,10 +323,53 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     loans = loans.filter((l) => l.balance > 0);
     let outstanding = loans.reduce((sum, l) => sum + l.balance, 0);
 
+    // 1b. Earmark/release events — capital reserved against loans that hit
+    // "equity received" but haven't originated on-chain yet, netted out of
+    // ELB below so it can't be instantly redeemed out from under the loan.
+    for (const e of earmarkEventsByPeriod.get(period) ?? []) {
+      earmarkedCapital =
+        e.kind === 'earmark' ? earmarkedCapital + e.amount : Math.max(0, earmarkedCapital - e.amount);
+    }
+
+    // 1c. Scheduled (30d/90d queue) redemptions maturing this period — paid
+    // out NOW, at this period's price, never the price at submission (any
+    // yield/loss during the lock window is borne by the redeemer, matching
+    // the real contract's process_redemption). No fee on this path.
+    pendingQueue = pendingQueue.filter((req) => {
+      if (req.eligiblePeriod > period) return true;
+      const isFyc = req.tranche === 'fyc';
+      const value = isFyc ? fyc : ffc;
+      const supply = isFyc ? fycSupply : ffcSupply;
+      const price = supply > 0 ? value / supply : 1;
+      const tokensBurned = price > 0 ? req.amount / price : 0;
+      if (isFyc) {
+        fyc -= req.amount;
+        fycSupply = Math.max(0, fycSupply - tokensBurned);
+      } else {
+        ffc -= req.amount;
+        ffcSupply = Math.max(0, ffcSupply - tokensBurned);
+      }
+      events.push({
+        period,
+        kind: 'redeem-processed',
+        detail: `$${Math.round(req.amount).toLocaleString()} ${req.tranche.toUpperCase()} scheduled redemption PAID at $${price.toFixed(4)}/token (submitted period ${req.requestPeriod}, no fee)`,
+      });
+      return false;
+    });
+    // Read fresh from pendingQueue at each call site below (not cached as a
+    // per-period constant) — a scheduled submission processed mid-loop, in
+    // step 2, must immediately count against a LATER same-period instant
+    // redemption's available liquidity, or the two could double-spend the
+    // same slice of ELB within one period.
+    const pendingAmount = (tranche: Tranche) =>
+      pendingQueue.filter((r) => r.tranche === tranche).reduce((s, r) => s + r.amount, 0);
+
     // 2. Mint/redeem activity — processed before this period's yield split,
     // same treatment as freshly-repaid principal above: capital that shows
     // up this period is already in v_tranche/reserve by the time yield gets
     // split, capital that leaves stops earning it immediately.
+    let protocolFeeFyc = 0;
+    let insuranceFeeFyc = 0;
     for (const a of activityByPeriod.get(period) ?? []) {
       const isFyc = a.tranche === 'fyc';
       const value = isFyc ? fyc : ffc;
@@ -275,23 +400,61 @@ export function runSimulation(config: ScenarioConfig): SimResult {
           kind: 'mint',
           detail: `$${Math.round(a.amount).toLocaleString()} ${a.tranche.toUpperCase()} minted at $${price.toFixed(4)}/token (+${Math.round(tokensMinted).toLocaleString()} tokens)`,
         });
+      } else if (a.mode === 'scheduled') {
+        const eligiblePeriod = period + LOCK_PERIODS[a.tranche];
+        pendingQueue.push({ tranche: a.tranche, amount: a.amount, requestPeriod: period, eligiblePeriod });
+        events.push({
+          period,
+          kind: 'redeem-scheduled',
+          detail: `$${Math.round(a.amount).toLocaleString()} ${a.tranche.toUpperCase()} redemption SUBMITTED — eligible period ${eligiblePeriod} (${a.tranche === 'fyc' ? '30d' : '90d'} lock), no fee`,
+        });
       } else {
-        const redeemAmount = Math.min(a.amount, value);
-        const tokensBurned = price > 0 ? redeemAmount / price : 0;
+        // Instant (default when unset) — draws on this tranche's available
+        // instant liquidity: ELB (idle reserve, net of outstanding loans AND
+        // earmarked capital), pro-rata split by pool share, minus whatever's
+        // already queued in the scheduled path for the same tranche.
+        const elbNow = Math.max(0, fyc + ffc - outstanding - earmarkedCapital);
+        const elbSplitNow = splitElb(elbNow, fyc, ffc);
+        const elbTrancheRaw = isFyc ? elbSplitNow.elbFyc : elbSplitNow.elbFfc;
+        const elbAvailable = Math.max(0, elbTrancheRaw - pendingAmount(a.tranche));
+        const fee = instantRedemptionFeeBps(a.tranche, a.amount, elbAvailable);
+        if (!fee.allowed) {
+          events.push({
+            period,
+            kind: 'redeem-blocked',
+            detail: `$${Math.round(a.amount).toLocaleString()} ${a.tranche.toUpperCase()} instant redemption BLOCKED — only $${Math.round(elbAvailable).toLocaleString()} of instant liquidity available; use the scheduled (${a.tranche === 'fyc' ? '30d' : '90d'}) queue instead`,
+          });
+          continue;
+        }
+        const fycPriceNow = fycSupply > 0 ? fyc / fycSupply : 1;
+        const ffcPriceNow = ffcSupply > 0 ? ffc / ffcSupply : 1;
+        const split = instantRedemptionFeeSplit(a.tranche, fee.feeValue, fycPriceNow, ffcPriceNow);
         if (isFyc) {
-          fyc -= redeemAmount;
+          // Fee-portion FYC tokens are never burned — only the net payout
+          // leaves v_fyc/fyc_supply; the fee just changes ownership.
+          const tokensBurned = price > 0 ? fee.netPayout / price : 0;
+          fyc -= fee.netPayout;
           fycSupply = Math.max(0, fycSupply - tokensBurned);
         } else {
-          ffc -= redeemAmount;
+          // Full amount leaves FFC (net payout + the fee-portion, which gets
+          // burned-and-converted rather than paid out) — see jr_to_sr.
+          const tokensBurned = price > 0 ? a.amount / price : 0;
+          ffc -= a.amount;
           ffcSupply = Math.max(0, ffcSupply - tokensBurned);
+          fyc += fee.feeValue;
+          fycSupply += split.fycTokensMinted;
         }
+        protocolFeeFyc += split.protocolValueUsd;
+        insuranceFeeFyc += split.insuranceValueUsd;
         events.push({
           period,
           kind: 'redeem',
-          detail: `$${Math.round(redeemAmount).toLocaleString()} ${a.tranche.toUpperCase()} redeemed at $${price.toFixed(4)}/token (−${Math.round(tokensBurned).toLocaleString()} tokens)${redeemAmount < a.amount ? ' — capped at available value' : ''}`,
+          detail: `$${Math.round(a.amount).toLocaleString()} ${a.tranche.toUpperCase()} redeemed INSTANTLY at $${price.toFixed(4)}/token — fee ${fee.feeBps.toFixed(2)}bps ($${fee.feeValue.toFixed(2)}, settled as FYC 50/50 protocol/insurance), net payout $${fee.netPayout.toFixed(2)}`,
         });
       }
     }
+    protocolFeeFycCum += protocolFeeFyc;
+    insuranceFeeFycCum += insuranceFeeFyc;
 
     // 3. Reserve yield — the reserve token's own price grows at the TRUE
     // rate, then the period's yield is derived by observing that delta and
@@ -430,6 +593,16 @@ export function runSimulation(config: ScenarioConfig): SimResult {
       fycLoss,
       ffcLoss,
       activeLoanCount: loans.length,
+      elbTotal: Math.max(0, fyc + ffc - outstanding - earmarkedCapital),
+      elbFyc: splitElb(Math.max(0, fyc + ffc - outstanding - earmarkedCapital), fyc, ffc).elbFyc,
+      elbFfc: splitElb(Math.max(0, fyc + ffc - outstanding - earmarkedCapital), fyc, ffc).elbFfc,
+      pendingFyc: pendingAmount('fyc'),
+      pendingFfc: pendingAmount('ffc'),
+      earmarkedCapital,
+      protocolFeeFyc,
+      insuranceFeeFyc,
+      protocolFeeFycCum,
+      insuranceFeeFycCum,
     });
   }
 

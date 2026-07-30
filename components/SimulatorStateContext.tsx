@@ -13,7 +13,7 @@ import { nextId } from '@/lib/idCounter';
  */
 
 const DEFAULT_ORIGINATIONS: OriginationEvent[] = [
-  { id: nextId(), period: 1, amount: 450000, apr: 0.08, termMonths: 36 },
+  { id: nextId(), period: 1, amount: 450000, apr: 0.15, termMonths: 36 },
 ];
 const DEFAULT_DEFAULTS: DefaultEvent[] = [];
 const DEFAULT_ACTIVITY: TrancheActivityEvent[] = [];

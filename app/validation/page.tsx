@@ -10,8 +10,8 @@ const Y = 600000;
 function buildSeries() {
   const xs = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.42, 0.44, 0.46, 0.48, 0.5, 0.52, 0.54];
   return xs.map((x) => {
-    const reserveNet = (1 - x) * 23800;
-    const loanNet = x * 68000;
+    const reserveNet = (1 - x) * 29750;
+    const loanNet = x * 127500;
     const P = x * 1000000;
     const coveragePct = coverageOf(P, F) * 100;
     const severity = severityOf(P, F, Y);
@@ -33,7 +33,7 @@ export default function ValidationPage() {
       <PageHeader
         eyebrow="pinochio / src / helpers / waterfall.rs"
         title="Validation against a realistic scenario"
-        lede="FYC $600K / FFC $400K, 8% loan APR, 2.8% reserve/USDY APY, loan book swept from $0 past the new gate. Both series below are exact — reserve yield and loan interest both net of the unchanged 85/15 fee split, reserve pro-rata by tranche size, loan interest through the severity-scaled premium curve. The two lines touch only at zero deployment, where there's no loan interest yet to carry a premium — everywhere loans exist, FFC sits strictly above FYC."
+        lede="FYC $600K / FFC $400K, 15% loan APR, 3.5% reserve/yield-token APY, loan book swept from $0 past the new gate. Both series below are exact — reserve yield and loan interest both net of the unchanged 85/15 fee split, reserve pro-rata by tranche size, loan interest through the severity-scaled premium curve. The two lines touch only at zero deployment, where there's no loan interest yet to carry a premium — everywhere loans exist, FFC sits strictly above FYC."
       />
 
       <Card>
@@ -47,13 +47,13 @@ export default function ValidationPage() {
         </div>
         <LineChart
           xDomain={[0, 54]}
-          yDomain={[0, 7]}
+          yDomain={[0, 12]}
           xTicks={[0, 10, 20, 30, 40, 50]}
-          yTicks={[0, 1, 2, 3, 4, 5, 6, 7]}
+          yTicks={[0, 2, 4, 6, 8, 10, 12]}
           formatX={(v) => Math.round(v) + '%'}
           formatY={(v) => v.toFixed(1) + '%'}
           xLabel="loan book as % of pool value (deployment)"
-          hLines={[{ y: 2.38, label: '2.38% reserve-only baseline' }]}
+          hLines={[{ y: 2.97, label: '2.97% reserve-only baseline' }]}
           vLines={[
             { x: 40, color: 'var(--text-muted)' },
             { x: 50, label: 'old gate (80% cov.)', color: 'var(--text-muted)' },
@@ -74,6 +74,13 @@ export default function ValidationPage() {
 
       <Card style={{ marginTop: 16 }}>
         <h3>Four iterations, in order</h3>
+        <p className="section-dek" style={{ fontSize: 11.5, marginBottom: 12 }}>
+          The specific percentages below (3.64%, 2.04%, 2.38% → 4.15%) are a historical record from the design
+          session that first compared these four approaches, captured under that session&rsquo;s own 8% loan
+          APR / 2.8% reserve APY scenario — not recomputed against the current default above. The point they
+          illustrate (each iteration&rsquo;s failure mode, and how the current one fixes it) holds regardless of
+          which rate assumptions generated them.
+        </p>
         <div className="grid-2">
           <div>
             <Badge tone="critical">1. Early draft — fixed 20% FFC share anchor</Badge>

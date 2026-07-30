@@ -161,7 +161,7 @@ export default function SimulatorPage() {
   const eventsAtCursor = result.events.filter((e) => e.period === cursor);
 
   function addOrigination() {
-    setOriginations((prev) => [...prev, { id: nextId(), period: 1, amount: 100000, apr: 0.08, termMonths: 36 }]);
+    setOriginations((prev) => [...prev, { id: nextId(), period: 1, amount: 100000, apr: 0.15, termMonths: 36 }]);
   }
   function addDefault() {
     setDefaults((prev) => [...prev, { id: nextId(), period: 6, lossAmount: 50000 }]);
@@ -189,7 +189,7 @@ export default function SimulatorPage() {
         <div className="grid-2">
           <NumberField label="Initial FYC (senior)" value={initialFyc} onChange={setInitialFyc} step={10000} prefix="$" />
           <NumberField label="Initial FFC (junior)" value={initialFfc} onChange={setInitialFfc} step={10000} prefix="$" />
-          <NumberField label="Reserve/USDY APY (true rate)" value={reserveApy * 100} onChange={(v) => setReserveApy(v / 100)} step={0.1} suffix="%" />
+          <NumberField label="Reserve/yield-token APY (true rate)" value={reserveApy * 100} onChange={(v) => setReserveApy(v / 100)} step={0.1} suffix="%" />
           <NumberField label="Simulation duration (periods)" value={periods} onChange={(v) => setPeriods(Math.max(1, Math.min(240, Math.round(v))))} step={1} />
           <NumberField
             label="Severity gate (origination)"
@@ -303,7 +303,10 @@ export default function SimulatorPage() {
           originations, generated the same way. FFC mints are checked against the mint floor when their period
           arrives; a blocked mint shows up in the event log, same as a blocked origination. Priced at this
           model&rsquo;s single v_tranche/supply price — the real contract mints at the optimistic price and
-          redeems at the conservative one, which this simplified model doesn&rsquo;t distinguish.
+          redeems at the conservative one, which this simplified model doesn&rsquo;t distinguish. Redeem rows
+          default to <b>instant</b> — capped at that tranche&rsquo;s available ELB liquidity (see /redemption)
+          at a liquidity-scaled fee, settled as FYC into the protocol/insurance wallets — or can be switched to{' '}
+          <b>scheduled</b>, which queues for the 30d/90d lock and pays out fee-free once eligible.
         </p>
 
         {!randomActivityMode ? (
@@ -324,6 +327,14 @@ export default function SimulatorPage() {
                   onChange={(v) => updateActivity(setTrancheActivity, a.id, { kind: v as 'mint' | 'redeem' })}
                 />
                 <MiniField label="amount $" value={a.amount} onChange={(v) => updateActivity(setTrancheActivity, a.id, { amount: v })} step={5000} />
+                {a.kind === 'redeem' && (
+                  <MiniSelect
+                    label="mode"
+                    value={a.mode ?? 'instant'}
+                    options={[{ value: 'instant', label: 'instant (fee)' }, { value: 'scheduled', label: 'scheduled (queue)' }]}
+                    onChange={(v) => updateActivity(setTrancheActivity, a.id, { mode: v as 'instant' | 'scheduled' })}
+                  />
+                )}
               </EventRow>
             ))}
             <button className="pill neutral" style={{ cursor: 'pointer', border: 'none', marginTop: 8 }} onClick={addActivity}>
@@ -442,6 +453,16 @@ export default function SimulatorPage() {
             value={`${step.loanObservedApyPct.toFixed(2)}%`}
             sub="realized rate across all active loans right now, not any single loan's own APR"
           />
+          <Readout
+            label="Instant liquidity (ELB) — FYC / FFC"
+            value={`${fmtUSD(step.elbFyc)} / ${fmtUSD(step.elbFfc)}`}
+            sub={`${fmtUSD(step.earmarkedCapital)} earmarked · pending queue ${fmtUSD(step.pendingFyc)} FYC / ${fmtUSD(step.pendingFfc)} FFC`}
+          />
+          <Readout
+            label="Redemption fee revenue (as FYC)"
+            value={`${fmtUSD(step.protocolFeeFycCum)} protocol / ${fmtUSD(step.insuranceFeeFycCum)} insurance`}
+            sub={step.protocolFeeFyc + step.insuranceFeeFyc > 0 ? `+${fmtUSD(step.protocolFeeFyc + step.insuranceFeeFyc)} this period` : 'cumulative — see /redemption'}
+          />
         </div>
 
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
@@ -453,9 +474,9 @@ export default function SimulatorPage() {
             <Pill
               key={i}
               tone={
-                e.kind === 'origination-blocked' || e.kind === 'mint-blocked'
+                e.kind === 'origination-blocked' || e.kind === 'mint-blocked' || e.kind === 'redeem-blocked'
                   ? 'bad'
-                  : e.kind === 'origination' || e.kind === 'mint'
+                  : e.kind === 'origination' || e.kind === 'mint' || e.kind === 'redeem-processed'
                     ? 'good'
                     : 'neutral'
               }

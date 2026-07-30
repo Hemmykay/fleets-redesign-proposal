@@ -9,6 +9,13 @@ import {
   monthlyPayment,
   fmtUSD,
   fmtUSD2,
+  splitElb,
+  instantRedemptionFeeBps,
+  convertTranche,
+  blendedApy,
+  YIELD_TARGET,
+  fmtPct,
+  PERIODS_PER_YEAR,
 } from '@/lib/model';
 
 // Running example used throughout the app.
@@ -23,6 +30,14 @@ const k = kFromCoverageAndSeverity(coveragePct, severity);
 const reserveSplit = splitBaseYieldTokenYield(10000, FYC, FFC);
 const levInt = levelizedInterest(100000, 0.15, 36);
 const mp = monthlyPayment(100000, 0.15, 36);
+
+const elb = splitElb(FYC + FFC - OUT, FYC, FFC);
+const exampleFee = instantRedemptionFeeBps('fyc', 20000, 40000);
+const exampleConvert = convertTranche('jrToSr', 10000, 1.04, 0.97);
+const exampleBlend = blendedApy([
+  { id: 'usdy', capitalUsd: 600000, apy: 0.042, enabled: true },
+  { id: 'syrupUSDC', capitalUsd: 300000, apy: 0.028, enabled: true },
+]);
 
 interface Entry {
   term: string;
@@ -63,7 +78,7 @@ const entries: { group: string; items: Entry[] }[] = [
       {
         term: 'Outstanding principal',
         symbol: 'P, or outstanding',
-        def: 'The sum of every currently-active loan’s remaining balance — the loan book. Not the same as the pool’s total value: some of the pool sits as idle reserve (USDY), which is not exposed to loan-default risk at all.',
+        def: 'The sum of every currently-active loan’s remaining balance — the loan book. Not the same as the pool’s total value: some of the pool sits as idle reserve (a yield-bearing token — USDY, syrupUSDC, or any other registered source), which is not exposed to loan-default risk at all.',
         example: <>In the running example: <code>{fmtUSD(OUT)}</code> outstanding, out of a <code>{fmtUSD(FYC + FFC)}</code> pool — the rest, <code>{fmtUSD(FYC + FFC - OUT)}</code>, sits as reserve.</>,
       },
     ],
@@ -171,8 +186,34 @@ const entries: { group: string; items: Entry[] }[] = [
       {
         term: 'True amortization',
         def: 'The borrower’s real, contractual repayment schedule — one level monthly payment, with the interest portion declining and the principal portion rising every period, exactly as a standard loan works. This never changes; it’s what the fleet operator sees on their own dashboard.',
-        formula: <>{'M = P·r / (1 − (1+r)^−n),  r = APR/12,  n = term in months'}</>,
-        example: <>A $100,000 loan at 15% APR over 36 months: M = <b>{fmtUSD(mp)}</b>/month.</>,
+        formula: <>{'M = P·r / (1 − (1+r)^−n),  r = APR / PERIODS_PER_YEAR ≈ APR/12.1667,  n = term in periods (30d each)'}</>,
+        example: (
+          <>
+            A $100,000 loan at 15% APR over 36 periods (each 30 days, not a calendar month — see{' '}
+            <b>PERIODS_PER_YEAR</b> below): M = <b>{fmtUSD(mp)}</b>/period.
+          </>
+        ),
+      },
+      {
+        term: 'PERIODS_PER_YEAR',
+        symbol: 'the day-count fix',
+        def: (
+          <>
+            How many 30-day periods fit in a real, 365-day year — 12.1667, not a flat 12. Before this round,
+            loan amortization (<code>compute_monthly_payment</code>/<code>period_interest</code>) hardcoded{' '}
+            <code>/ 12</code>, silently treating every 30-day period as exactly 1/12 of a year (12 periods
+            is only 360 days) — while yield-source annualization (<code>observed_source_apy_bps</code>) had
+            already, separately, chosen to annualize against a real 365-day year. Two different implicit
+            calendars for the same word &ldquo;period,&rdquo; in the same pool. Neither was <em>wrong</em> in
+            isolation — 30/360 is a common, legitimate day-count convention in finance — but mixing the two
+            meant a $1 of loan interest and a $1 of reserve yield didn&rsquo;t represent the same
+            &ldquo;per year&rdquo; claim, and a stated 15% APR loan was actually costing{' '}
+            <b>{(0.15 * (PERIODS_PER_YEAR / 12) * 100).toFixed(2)}%</b> once measured against a true calendar
+            year. Fixed by using this one constant everywhere a rate crosses between &ldquo;per period&rdquo;
+            and &ldquo;per year&rdquo; — amortization included.
+          </>
+        ),
+        formula: <>{'PERIODS_PER_YEAR = 365 days / 30 days = 12.1666...'}</>,
       },
       {
         term: 'Levelized interest',
@@ -183,13 +224,72 @@ const entries: { group: string; items: Entry[] }[] = [
       {
         term: 'Net yield / gross yield',
         symbol: 'the 85/15 fee split',
-        def: 'Every yield stream — loan interest and reserve/USDY appreciation alike — has a 15% protocol fee taken off the top before any tranche split happens. The remaining 85% ("net yield") is what actually gets divided between FYC and FFC. The 15% fee mints new FYC tokens, split 2:1 protocol:insurance. Unchanged throughout every iteration of this redesign.',
+        def: 'Every yield stream — loan interest and reserve/yield-token appreciation alike — has a 15% protocol fee taken off the top before any tranche split happens. The remaining 85% ("net yield") is what actually gets divided between FYC and FFC. The 15% fee mints new FYC tokens, split 2:1 protocol:insurance. Unchanged throughout every iteration of this redesign.',
       },
       {
-        term: 'Reserve / USDY yield split',
-        def: 'The pool’s idle capital (not deployed as loans) earns yield from holding USDY. This yield is split flat pro-rata by tranche size — each tranche gets exactly its share of the combined pool, no curve, no coverage or severity involved. This is the ONE place a simple "your share of the pool" split still applies directly — everywhere else in this redesign, the split is risk-adjusted. The reason: reserve appreciation carries no loan-specific risk, so there is nothing for a first-loss premium to compensate for.',
+        term: 'Reserve / yield-token yield split',
+        def: 'The pool’s idle capital (not deployed as loans) earns yield from holding a yield-bearing token — USDY, syrupUSDC, or any other registered source. This yield is split flat pro-rata by tranche size — each tranche gets exactly its share of the combined pool, no curve, no coverage or severity involved. This is the ONE place a simple "your share of the pool" split still applies directly — everywhere else in this redesign, the split is risk-adjusted. The reason: reserve appreciation carries no loan-specific risk, so there is nothing for a first-loss premium to compensate for.',
         formula: <>{'fyc_share = net_yield × FYC / (FYC + FFC)\nffc_share = net_yield − fyc_share'}</>,
         example: <>A $10,000 net reserve-yield month, FYC $600K / FFC $400K: FYC gets <b style={{ color: 'var(--fyc)' }}>{fmtUSD(reserveSplit.fycShare)}</b> (60%), FFC gets <b style={{ color: 'var(--ffc)' }}>{fmtUSD(reserveSplit.ffcShare)}</b> (40%) — exactly their pool share, nothing more.</>,
+      },
+    ],
+  },
+  {
+    group: 'Redemption & liquidity (round 2)',
+    items: [
+      {
+        term: 'ELB',
+        symbol: 'Excess Liquidity Balance',
+        def: 'The pool’s idle capital sitting in a yield-bearing reserve token, not deployed as loans and not already earmarked against a loan that’s reached "equity received." Split pro-rata by each tranche’s share of the combined pool — the same flat pool-share formula the reserve-yield split already uses, applied to capital instead of yield.',
+        formula: <>{'elb_total = (FYC + FFC) − outstanding − earmarked\nelb_tranche = elb_total × V_tranche / (FYC + FFC)'}</>,
+        example: <>Running example, no earmarks: ELB = {fmtUSD(FYC + FFC - OUT)}, split <b style={{ color: 'var(--fyc)' }}>{fmtUSD(elb.elbFyc)}</b> FYC / <b style={{ color: 'var(--ffc)' }}>{fmtUSD(elb.elbFfc)}</b> FFC.</>,
+      },
+      {
+        term: 'Instant vs. scheduled redemption',
+        def: 'Instant (accelerated) redemption pays out immediately from a tranche’s own ELB share at a liquidity-scaled fee, and is only available up to that tranche’s available ELB — never partially served beyond it. Scheduled redemption is the existing 30d (FYC) / 90d (FFC) queue: no fee, but priced at whatever the conservative price is when it’s actually processed, not when it was submitted, so any yield or loss during the wait is the redeemer’s.',
+      },
+      {
+        term: 'Instant-redemption fee scale',
+        def: 'The fee rate charged on the WHOLE redemption is read off where the amount lands within that tranche’s available ELB, then applied flat. FYC’s band (10–50 bps) sits below FFC’s (50–100 bps) — junior liquidity is scarcer and riskier to hand out on demand.',
+        formula: <>{'fee_bps = fee_min + (amount / elb_tranche) × (fee_max − fee_min)'}</>,
+        example: <>$40K ELB<sub>FYC</sub>, redeeming {fmtUSD(20000)} (the midpoint): fee = <b>{exampleFee.feeBps.toFixed(0)} bps</b>, fee value {fmtUSD(exampleFee.feeValue)}, net payout {fmtUSD(exampleFee.netPayout)}.</>,
+      },
+      {
+        term: 'jr_to_sr / sr_to_jr',
+        symbol: 'tranche conversion',
+        def: 'Burns one tranche’s tokens at ITS conservative price and mints the other’s at ITS conservative price — V_pool is unchanged by construction, value moves between tranches, none is invented. Used directly by the FFC-side redemption fee (burn fee-portion FFC, mint equivalent FYC into the fee wallets) — see /tranche-swap.',
+        formula: <>{'value = tokens_in × price_source\ntokens_out = value / price_dest'}</>,
+        example: <>Converting 10,000 FFC @ $0.97 (FYC @ $1.04): burns {fmtUSD(exampleConvert.valueUsd)}, mints <b>{exampleConvert.tokensMinted.toFixed(2)}</b> new FYC tokens — same {fmtUSD(exampleConvert.valueUsd)}, now in FYC.</>,
+      },
+      {
+        term: 'Redemption fee settlement',
+        def: 'Every redemption fee is settled as FYC, split 50/50 between protocol_wallet and insurance_wallet. Redeeming FYC: fee-portion tokens are transferred, never burned. Redeeming FFC: fee-portion tokens ARE burned and the same value is minted as new FYC via jr_to_sr — deliberate: treasuries should never carry first-loss (FFC) exposure.',
+      },
+      {
+        term: 'Earmarked loan capital',
+        def: 'Capital reserved out of ELB the moment a loan reaches the off-chain "equity received" pipeline stage — before it actually originates on-chain — so it can’t be instantly redeemed out from under a loan that’s already committed. Released either when the loan originates (moves into outstanding_principal) or is cancelled; carries an expiry so a forgotten cancellation can’t permanently over-reserve capital.',
+      },
+      {
+        term: 'Yield source',
+        symbol: 'YieldSourceState (multi-source)',
+        def: 'Extends the single registered reserve token into a full registry — admin-gated to initialize (assert_admin, same as set_redemption_fees) and admin-gated to disable. A disabled source stops receiving new deposits and is prioritized for unwinding on the next redemption that needs to swap yield-token → stable.',
+      },
+      {
+        term: 'Per-source observed APY',
+        symbol: 'the building block',
+        def: 'Each yield source tracks its OWN observed APY independently — not a shared estimate. Computed once per epoch tick (run_yield_epoch), the exact same price-delta method the pool already used for its one original reserve token, just run once per registered source now instead of once for the whole pool.',
+        formula: <>{'apy_i = (price_i_now − price_i_last) / price_i_last × (SECONDS_PER_YEAR / elapsed_i)'}</>,
+      },
+      {
+        term: 'Blended portfolio APY',
+        def: 'The capital-weighted average of every per-source APY above — structurally identical to Hylo’s published "Average SOL Reserve Yield" equation. Only ENABLED sources count: a disabled source contributes zero weight to the average, not just zero yield, so it can’t drag the blend down while it’s being wound down.',
+        formula: <>{'blended_apy = Σ(capital_i × apy_i) / Σ capital_i     (enabled sources only)'}</>,
+        example: <>USDY $600K @ 4.2% + syrupUSDC $300K @ 2.8%: blended = <b>{fmtPct(exampleBlend, 2)}</b>.</>,
+      },
+      {
+        term: 'Target yield range',
+        def: 'New capital routes to whichever enabled source moves the blended APY closest to the target, among candidates landing inside [min, max]. The floor exists purely so "couldn’t reach it" is never an error; the ceiling is soft — overshooting is fine, and routing reaches for the highest available APY if nothing lands in range at all.',
+        example: <>[min, target, max] = [{fmtPct(YIELD_TARGET.min, 0)}, {fmtPct(YIELD_TARGET.target, 1)}, {fmtPct(YIELD_TARGET.max, 0)}].</>,
       },
     ],
   },

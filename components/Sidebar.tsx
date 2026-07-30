@@ -25,9 +25,18 @@ const NAV: { group: string; items: NavItem[] }[] = [
     ],
   },
   {
+    group: 'Redemption & liquidity',
+    items: [
+      { href: '/redemption', num: '10', label: 'Instant & scheduled redemption' },
+      { href: '/tranche-swap', num: '11', label: 'jr_to_sr / sr_to_jr' },
+      { href: '/yield-sources', num: '12', label: 'Multi-yield-source routing' },
+    ],
+  },
+  {
     group: 'Tools',
     items: [
       { href: '/glossary', num: '§', label: 'Glossary' },
+      { href: '/latex', num: '∑', label: 'LaTeX equations' },
       { href: '/simulator', num: '▶', label: 'Scenario simulator' },
       { href: '/code-diff', num: '⎇', label: 'Code diff' },
     ],
