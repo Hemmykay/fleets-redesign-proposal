@@ -825,22 +825,36 @@ export interface YieldSource {
 }
 
 /**
- * Blended portfolio APY — capital-weighted average across every source.
- * Structurally identical to Hylo's published "Average SOL Reserve Yield"
- * equation (Σ(supply×price×apy) / total reserve); ours weights by USD
- * capital directly since each source already reports its own USD value.
+ * Blended portfolio APY — capital-weighted average across every source that
+ * still has capital deployed. Structurally identical to Hylo's published
+ * "Average SOL Reserve Yield" equation (Σ(supply×price×apy) / total
+ * reserve); ours weights by USD capital directly since each source already
+ * reports its own USD value.
+ *
+ * `enabled` is NOT part of this weighting. A disabled source is still
+ * earning real yield on whatever capital it hasn't been unwound out of yet
+ * — excluding it here would understate the pool's actual blended return
+ * for as long as that capital sits there. `enabled` only matters to
+ * pickRebalanceTarget below (where NEW capital should route to) — a
+ * completely separate decision from "what is this pool actually earning
+ * right now." The only source that should drop out of the blend is one
+ * with zero capital left — and that happens for free, since a capitalUsd:0
+ * term contributes zero to both the numerator and the denominator. The
+ * `capitalUsd > 0` filter below is just a defensive skip (no wasted work,
+ * no risk of a stray NaN/Infinity apy on an empty source poisoning the
+ * sum), not a correctness requirement.
  *
  * ```txt
- *              Σ (capital_i × apy_i)
- * blended_apy = ----------------------
+ *              Σ (capital_i × apy_i)     — every source with capital > 0,
+ * blended_apy = ----------------------     enabled or disabled
  *                   Σ capital_i
  * ```
  */
 export function blendedApy(sources: YieldSource[]): number {
-  const enabled = sources.filter((s) => s.enabled);
-  const total = enabled.reduce((s, x) => s + x.capitalUsd, 0);
+  const active = sources.filter((s) => s.capitalUsd > 0);
+  const total = active.reduce((s, x) => s + x.capitalUsd, 0);
   if (total <= 0) return 0;
-  return enabled.reduce((s, x) => s + x.capitalUsd * x.apy, 0) / total;
+  return active.reduce((s, x) => s + x.capitalUsd * x.apy, 0) / total;
 }
 
 export interface RebalanceChoice {
@@ -850,13 +864,18 @@ export interface RebalanceChoice {
 }
 
 /**
- * Picks which ENABLED source new capital should route into. Scores every
- * candidate by the blended APY the pool would have right after routing
- * `depositAmount` into it; prefers whichever lands closest to
- * YIELD_TARGET.target among candidates that land inside [min, max]. If none
- * land in range, prefers the single highest resulting APY instead of
- * failing — undershooting forever is the failure mode this guards against,
- * not overshooting.
+ * Picks which ENABLED source new capital should route into — deliberately
+ * still `enabled`-gated, unlike blendedApy above. This is a routing
+ * decision ("where should new money go"), not a yield-measurement one
+ * ("what is the pool earning right now") — a disabled source is being
+ * wound down, so it should never be the destination for fresh deposits,
+ * even though it still counts fully in blendedApy until its own capital
+ * actually reaches zero. Scores every candidate by the blended APY the
+ * pool would have right after routing `depositAmount` into it; prefers
+ * whichever lands closest to YIELD_TARGET.target among candidates that
+ * land inside [min, max]. If none land in range, prefers the single
+ * highest resulting APY instead of failing — undershooting forever is the
+ * failure mode this guards against, not overshooting.
  */
 export function pickRebalanceTarget(sources: YieldSource[], depositAmount: number): RebalanceChoice {
   const enabled = sources.filter((s) => s.enabled);

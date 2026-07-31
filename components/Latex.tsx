@@ -17,6 +17,12 @@ export default function Latex({
     displayMode: display,
     throwOnError: false,
     strict: 'ignore',
+    // \htmlData is a trust-gated KaTeX command — safe here because every
+    // tex string on this app is developer-authored (see app/latex/page.tsx),
+    // never user input. Powers /latex's clickable-variable feature: each
+    // named symbol is wrapped in \htmlData{v=KEY}{...}, and a click handler
+    // on the container reads data-v back out via event delegation.
+    trust: true,
   });
   return <span className={display ? 'latex-block' : 'latex-inline'} dangerouslySetInnerHTML={{ __html: html }} />;
 }

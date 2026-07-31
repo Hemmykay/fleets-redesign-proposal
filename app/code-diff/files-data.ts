@@ -3241,7 +3241,7 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
   path: "pinochio/src/instructions/run_yield_epoch.rs",
   status: "M",
   category: "pinocchio",
-  why: "Backward compatible, not a breaking rewrite: called with the original 5 accounts, this ticks the pool's primary reserve exactly as before, byte-for-byte the same math, still writing PoolState's own c_tokens/last_base_yield_token_price/last_epoch_ts — every existing off-chain caller keeps working unmodified. Called with 6 accounts — a yield_source account inserted before the oracle — it ticks THAT registered YieldSourceState (USDY, syrupUSDC, ...) instead, using the same observed_source_apy_bps-style 24h-epoch math from helpers/allocation.rs, without ever touching PoolState. Adding a source's epoch tick is a longer accounts array, not a new instruction or a new tag. v_pool for the fee/split math still only sums the primary reserve either way — the same tracked helpers/pricing.rs follow-up noted on helpers/allocation.rs — so this file doesn't silently claim more coverage than it has. Round 2: the 6-account branch now also writes the derived rate into YieldSourceState.observed_apy_bps, feeding helpers/liquidity.rs::blended_apy — WHICH source new capital should route into (the [3%, 3.5%, 7%] target-range logic) is deliberately kept an off-chain preview computation, not folded into this instruction; this instruction only ever ticks the one source it's given.",
+  why: "Backward compatible, not a breaking rewrite: called with the original 5 accounts, this ticks the pool's primary reserve exactly as before, byte-for-byte the same math, still writing PoolState's own c_tokens/last_base_yield_token_price/last_epoch_ts — every existing off-chain caller keeps working unmodified. Called with 6 accounts — a yield_source account inserted before the oracle — it ticks THAT registered YieldSourceState (USDY, syrupUSDC, ...) instead, using the same observed_source_apy_bps-style 24h-epoch math from helpers/allocation.rs, without ever touching PoolState. Adding a source's epoch tick is a longer accounts array, not a new instruction or a new tag. v_pool for the fee/split math still only sums the primary reserve either way — the same tracked helpers/pricing.rs follow-up noted on helpers/allocation.rs — so this file doesn't silently claim more coverage than it has. Round 2: the 6-account branch now also writes the derived rate into YieldSourceState.observed_apy_bps, feeding helpers/liquidity.rs::blended_apy — WHICH source new capital should route into (the [3%, 3.5%, 7%] target-range logic) is deliberately kept an off-chain preview computation, not folded into this instruction; this instruction only ever ticks the one source it's given. Deliberately NOT gated on is_active: a disabled source still gets ticked here (fresh Pyth price, fresh observed_apy_bps, its net yield still split into FYC/FFC) for as long as it holds capital — disabling only stops new deposits (deposit_yield_token.rs) and new-capital routing (helpers/liquidity.rs::pick_rebalance_target), not the source's own yield accrual. Gating the tick on is_active would have frozen a disabled source's reported APY and stopped distributing yield it's still genuinely earning, which is exactly the bug helpers/liquidity.rs::blended_apy_bps was also fixed to stop assuming (see that file's own why).",
   original: `//! Distribute newly-accrued base-yield-token yield (epoch tick).
 //! Accounts: [authority, pool, fyc, ffc, base_yield_token_oracle]
 //! Data: ()
@@ -3344,7 +3344,16 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
         if ys.pool != *pool.address().as_array() || ys.oracle != *oracle.address().as_array() {
             return Err(FleetError::Unauthorized.into());
         }
-        if ys.is_active == 0 { return Err(FleetError::YieldSourceInactive.into()); }
+        // CHANGED (round 2) — deliberately NOT gated on ys.is_active. Disabled
+        // only means "stop accepting new deposits" (deposit_yield_token.rs)
+        // and "don't route new capital here" (pick_rebalance_target below) —
+        // a disabled source keeps earning real yield on whatever capital it
+        // hasn't been unwound out of yet, and blocking its tick here would
+        // freeze that yield mid-flight instead of letting it keep splitting
+        // into FYC/FFC until the position is actually wound down to zero.
+        // Harmless once c_tokens reaches 0 too: gross_yield is c_tokens ×
+        // price_delta, so a fully-unwound source just ticks its price/APY
+        // observation forward for free, contributing nothing to net_yield.
 
         let price_now = fetch_base_yield_token_price(oracle)?;
         if price_now < ys.last_price { return Err(FleetError::StaleOraclePrice.into()); }
@@ -3406,7 +3415,7 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
   path: "pinochio/src/instructions/initialize_yield_source.rs",
   status: "U",
   category: "pinocchio",
-  why: "New instruction (ix_tag::INITIALIZE_YIELD_SOURCE, tag 16). Registers one more YieldSourceState PDA for a yield-bearing reserve token (USDY, syrupUSDC, ...) — the mechanism the user asked for to support more than one yield-bearing token without a breaking change. Structurally mirrors initialize_tranche.rs: verify_pda + create_pda_account + a fresh zero-copy struct write, admin-gated the same way originate_loan.rs gates itself (p.assert_admin). Never touches PoolState's layout — only increments its new yield_source_count byte. Already satisfies 'only an admin can add a yield-bearing collateral token' — confirmed p.assert_admin gates this in round 1, unchanged this round. Round 2 just zero-initializes the new observed_apy_bps field alongside the others.",
+  why: "New instruction (ix_tag::INITIALIZE_YIELD_SOURCE, tag 16). Registers one more YieldSourceState PDA for a yield-bearing reserve token (USDY, syrupUSDC, ...) — the mechanism the user asked for to support more than one yield-bearing token without a breaking change. Structurally mirrors initialize_tranche.rs: verify_pda + create_pda_account + a fresh zero-copy struct write, admin-gated the same way originate_loan.rs gates itself (p.assert_admin). Never touches PoolState's layout — only increments its new yield_source_count byte. Already satisfies 'only an admin can add a yield-bearing collateral token' — confirmed p.assert_admin gates this in round 1, unchanged this round. Round 2 just zero-initializes the new observed_apy_bps field alongside the others. The `oracle` account stored here (a Pyth PriceUpdateV2 account, same discriminator check as every other oracle read in this program — see constants.rs) is what run_yield_epoch.rs reads every tick via fetch_base_yield_token_price; almost every realistic candidate token for this slot (USDY, syrupUSDC, and yield-bearing stable-value wrappers generally) starts priced at $1.00 and appreciates slowly from there, so last_price on a freshly-initialized source is effectively \"$1.00 until the first epoch tick,\" not an arbitrary number an admin picks.",
   original: "",
   proposed: `//! Register a new yield-bearing reserve token (USDY, syrupUSDC, ...) as an
 //! additional YieldSourceState PDA. Adding a source never touches PoolState's
@@ -3971,7 +3980,7 @@ pub mod waterfall;`
   path: "pinochio/src/helpers/liquidity.rs",
   status: "U",
   category: "pinocchio",
-  why: "New file (round 2) — ELB (excess liquidity balance), the instant-redemption fee scale, and multi-yield-source blended-yield routing. Split into its own module rather than folded into coverage.rs, same reasoning /implementation gives for curve.rs: keeps this math independently property-testable. Follows the struct/pure-inner pattern from /implementation pattern 1 — pick_rebalance_target is explicitly #[cfg(feature = \"offchain\")], the same trust boundary Jupiter/Titan route selection already uses; the on-chain instructions here only ever receive an already-chosen source id.",
+  why: "New file (round 2) — ELB (excess liquidity balance), the instant-redemption fee scale, and multi-yield-source blended-yield routing. Split into its own module rather than folded into coverage.rs, same reasoning /implementation gives for curve.rs: keeps this math independently property-testable. Follows the struct/pure-inner pattern from /implementation pattern 1 — pick_rebalance_target is explicitly #[cfg(feature = \"offchain\")], the same trust boundary Jupiter/Titan route selection already uses; the on-chain instructions here only ever receive an already-chosen source id. blended_apy_bps deliberately does NOT filter on is_active (it did in an earlier draft — fixed here): a disabled source is still earning real, Pyth-priced yield on whatever capital hasn't been unwound out of it yet (instructions/run_yield_epoch.rs keeps ticking it precisely so this stays true), so folding it out of the blend would understate the pool's actual return. Only c_tokens == 0 excludes a source, and it does so for free via the weighted-sum math, not a special case. is_active still gates pick_rebalance_target (never route NEW capital to a source being wound down) and pick_unwind_source (only a disabled source is ever a withdrawal-order candidate) — both routing/ordering decisions, not yield measurement, which is exactly why they keep the flag and blended_apy_bps doesn't.",
   original: "",
   proposed: `//! Redemption liquidity — ELB (excess liquidity balance), the instant-
 //! redemption fee scale, and multi-yield-source blended-yield routing.
@@ -4036,14 +4045,23 @@ fn instant_redemption_fee_inner(tranche: u8, amount: u64, elb_tranche: u64) -> O
     Some(InstantFee { fee_bps, fee_value, net_payout: amount.saturating_sub(fee_value) })
 }
 
-/// Capital-weighted blended APY across every ENABLED yield source —
-/// structurally identical to Hylo's published "Average SOL Reserve Yield"
-/// equation. A disabled (is_active == 0) source doesn't count toward the
-/// portfolio target at all — it's being wound down, not steered toward.
+/// Capital-weighted blended APY across every source that still holds
+/// capital — is_active is NOT part of this weighting. A disabled source is
+/// still earning real yield on whatever hasn't been unwound out of it yet
+/// (run_yield_epoch keeps ticking it — see instructions/run_yield_epoch.rs
+/// — so its last_price/observed_apy_bps stay current, both read straight
+/// off that source's own Pyth price account, same as every enabled source),
+/// so excluding it here would understate the pool's actual blended return.
+/// is_active only matters to pick_rebalance_target/pick_unwind_source below
+/// — where NEW capital should go, and which source unwinds first — a
+/// separate question from "what is the pool earning right now." A source
+/// with zero capital contributes zero to both total_capital and weighted,
+/// so it drops out on its own; the c_tokens > 0 filter below is a
+/// defensive skip (avoids a stray 0×apy term), not a correctness gate.
 pub fn blended_apy_bps(sources: &[YieldSourceState]) -> u64 {
     let mut total_capital: u128 = 0;
     let mut weighted: u128 = 0;
-    for s in sources.iter().filter(|s| s.is_active != 0) {
+    for s in sources.iter().filter(|s| s.c_tokens > 0) {
         let capital = s.c_tokens as u128 * s.last_price as u128;
         total_capital += capital;
         weighted += capital * s.observed_apy_bps as u128;

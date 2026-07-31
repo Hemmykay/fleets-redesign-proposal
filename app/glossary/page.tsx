@@ -224,7 +224,7 @@ const entries: { group: string; items: Entry[] }[] = [
       {
         term: 'Yield source',
         symbol: 'YieldSourceState',
-        def: 'A registered yield-bearing reserve token the pool holds alongside — or instead of — its original primary reserve: USDY, syrupUSDC, or any future addition. Each gets its own PDA tracking its own token balance and epoch price history, so optimistic pricing and yield accrual work correctly per-source instead of only for whichever reserve token was there first.',
+        def: 'A registered yield-bearing reserve token the pool holds alongside — or instead of — its original primary reserve: USDY, syrupUSDC, or any future addition. Each gets its own PDA tracking its own token balance and epoch price history, so optimistic pricing and yield accrual work correctly per-source instead of only for whichever reserve token was there first. Almost every candidate token in this category is designed to start life pegged at $1.00 (a rebasing or accruing stable-value wrapper, not a floating asset) — its yield shows up as slow price appreciation away from that $1 peg over time, not volatility around it. See "Per-source observed APY" below for how that appreciation gets read on-chain.',
       },
     ],
   },
@@ -337,13 +337,13 @@ const entries: { group: string; items: Entry[] }[] = [
       {
         term: 'Per-source observed APY',
         symbol: 'the building block',
-        def: 'Each yield source tracks its OWN observed APY independently — not a shared estimate. Computed once per epoch tick (run_yield_epoch), the exact same price-delta method the pool already used for its one original reserve token, just run once per registered source now instead of once for the whole pool.',
+        def: 'Each yield source tracks its OWN observed APY independently — not a shared estimate. Computed once per epoch tick (run_yield_epoch), the exact same price-delta method the pool already used for its one original reserve token, just run once per registered source now instead of once for the whole pool. price_i_now and price_i_last both come from a Pyth price feed read on-chain (a Pyth price account address stored per YieldSourceState at initialize_yield_source) — never a client-supplied or admin-set number, so a source can’t be mispriced by anything other than the oracle itself. Since these tokens start pegged at $1.00 (see "Yield source" above), price_i_last is effectively "$1.00 plus whatever’s accrued since the source was registered or last ticked," not an arbitrary market price.',
         formula: <>{'apy_i = (price_i_now − price_i_last) / price_i_last × (SECONDS_PER_YEAR / elapsed_i)'}</>,
       },
       {
         term: 'Blended portfolio APY',
-        def: 'The capital-weighted average of every per-source APY above — structurally identical to Hylo’s published "Average SOL Reserve Yield" equation. Only ENABLED sources count: a disabled source contributes zero weight to the average, not just zero yield, so it can’t drag the blend down while it’s being wound down.',
-        formula: <>{'blended_apy = Σ(capital_i × apy_i) / Σ capital_i     (enabled sources only)'}</>,
+        def: 'The capital-weighted average of every per-source APY above — structurally identical to Hylo’s published "Average SOL Reserve Yield" equation. Every source with capital still deployed counts, ENABLED or DISABLED — a disabled source is still earning real yield on whatever it hasn’t been unwound out of yet, so excluding it would understate what the pool is actually earning. Only a source with zero capital left drops out, and it does so for free (a $0 term contributes zero to both the top and bottom of the average) — enabled/disabled only matters for "Target yield range" below, which decides where NEW capital routes, a different question from "what is this pool earning right now."',
+        formula: <>{'blended_apy = Σ(capital_i × apy_i) / Σ capital_i     (every source with capital > 0)'}</>,
         example: <>USDY $600K @ 4.2% + syrupUSDC $300K @ 2.8%: blended = <b>{fmtPct(exampleBlend, 2)}</b>.</>,
       },
       {

@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import LineChart from '@/components/LineChart';
 import { PageHeader, Card, Readout, Pill, Callout, Collapsible } from '@/components/ui';
+import { NumberInput } from '@/components/NumberInput';
 import { runSimulation, type OriginationEvent, type DefaultEvent, type TrancheActivityEvent } from '@/lib/simulate';
 import { generateRandomOriginations, generateRandomTrancheActivity, generateRandomDefaults } from '@/lib/random';
 import { fmtUSD, SEVERITY_MINT_FLOOR, ORIGINATION_FEE_FRACTION } from '@/lib/model';
@@ -1026,11 +1027,10 @@ function NumberField({
           {suffix}
         </span>
       </div>
-      <input
-        type="number"
+      <NumberInput
         step={step}
         value={value}
-        onChange={(e) => onChange(+e.target.value)}
+        onChange={onChange}
         style={{
           width: '100%',
           padding: '7px 10px',
@@ -1060,11 +1060,10 @@ function MiniField({
   return (
     <label style={{ display: 'flex', flexDirection: 'column', gap: 3, flex: '0 1 96px', fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
       {label}
-      <input
-        type="number"
+      <NumberInput
         step={step}
         value={value}
-        onChange={(e) => onChange(+e.target.value)}
+        onChange={onChange}
         style={{
           width: '100%',
           minWidth: 76,

@@ -341,6 +341,33 @@ input.ffc-slide { --accent-c: var(--ffc); }
 .latex-link-accent { background: var(--accent-wash); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
 .latex-link-accent:hover { background: color-mix(in srgb, var(--accent) 22%, var(--accent-wash)); color: var(--accent); }
 
+/* ---------- clickable variables inside a rendered formula — /latex ---------- */
+.latex-clickable { cursor: default; }
+.latex-clickable [data-v] {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background-color .12s ease;
+  padding: 0 1px;
+}
+.latex-clickable [data-v]:hover { background: var(--accent-wash); }
+.latex-var-popover {
+  margin: 10px 0 4px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--accent-wash);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  animation: collapsible-open .15s ease;
+}
+.latex-var-popover-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-primary); font-size: 14px; }
+.latex-var-popover-close {
+  background: none; border: none; cursor: pointer; color: var(--text-muted); font-size: 13px;
+  padding: 2px 6px; border-radius: 5px; line-height: 1;
+}
+.latex-var-popover-close:hover { background: var(--surface-3); color: var(--text-primary); }
+
 /* ---------- editable worked-example inputs — /latex ---------- */
 .worked-inputs { display: flex; flex-wrap: wrap; gap: 14px 18px; }
 .worked-input { display: flex; flex-direction: column; gap: 5px; min-width: 108px; }

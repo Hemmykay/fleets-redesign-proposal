@@ -32,8 +32,9 @@ export default function YieldSourcesPage() {
           <div className="formula">
             {`YieldSourceState {
   mint: Address,
-  token_balance: u64,
-  enabled: bool,
+  pyth_price_account: Address,    // Pyth price feed for this token, read
+  token_balance: u64,              // fresh every epoch tick — never a
+  enabled: bool,                   // client-supplied or admin-set number
   capital_deployed_usd: u64,      // token_balance × last observed price
   last_price: u64,
   last_epoch_ts: i64,
@@ -41,6 +42,16 @@ export default function YieldSourcesPage() {
 }                                  // the existing single-source calc`}
           </div>
         </Card>
+        <p className="section-dek" style={{ marginTop: 10 }}>
+          Every candidate source here (USDY, syrupUSDC, and effectively every other yield-bearing
+          stable-value wrapper) is designed to start life pegged at <b>$1.00</b> — it&rsquo;s not a
+          floating-price asset, it&rsquo;s a rebasing or accruing token whose price slowly climbs away
+          from that $1 peg as yield accrues. <code>pyth_price_account</code> is what makes that number
+          trustworthy on-chain: <code>initialize_yield_source</code> stores the token&rsquo;s Pyth price
+          feed address once, and every epoch tick reads the current price straight from that feed —
+          the exact same on-chain-oracle pattern already used anywhere else in the program that needs a
+          price it can&rsquo;t just take someone&rsquo;s word for.
+        </p>
       </div>
 
       <div style={{ marginTop: 28 }}>
@@ -63,15 +74,26 @@ export default function YieldSourcesPage() {
           is bigger, the same way a report-card GPA weights a 4-credit class more than a 1-credit one. Here,
           the bigger pile is $600, so the blend lands closer to 4% than to 2%.
         </Callout>
+        <Callout tone="amber">
+          <b>A disabled source still counts here.</b> &ldquo;Enabled&rdquo; only decides where NEW capital is
+          allowed to go (§3 below) and which source unwinds first on redemption (§4) — it says nothing about
+          whether a source is still earning yield. legacy-token below is disabled but still holds{' '}
+          {fmtUSD(SOURCES[2].capitalUsd)} of real, still-appreciating capital, so it stays in the blend at full
+          weight until that balance is actually wound down to zero — excluding it while it&rsquo;s still
+          deployed would understate what the pool is really earning. Once its balance reaches $0 it drops out
+          on its own, for free: a $0 term contributes nothing to either side of the average, so there&rsquo;s no
+          special &ldquo;is it disabled&rdquo; check anywhere in <code>blended_apy</code> — only a &ldquo;does it
+          have capital&rdquo; one.
+        </Callout>
         <Card style={{ marginTop: 14 }}>
           <h3 style={{ marginTop: 0 }}>Worked example</h3>
           <div className="readout-grid">
             {SOURCES.map((s) => (
               <Readout
                 key={s.id}
-                label={s.id + (s.enabled ? '' : ' — disabled')}
+                label={s.id + (s.enabled ? '' : ' — disabled, still counted')}
                 value={`${fmtUSD(s.capitalUsd)} @ ${fmtPct(s.apy, 1)}`}
-                color={s.enabled ? undefined : 'var(--critical)'}
+                color={s.enabled ? undefined : 'var(--warning)'}
               />
             ))}
             <Readout label="blended portfolio APY" value={fmtPct(currentBlended, 2)} color="var(--good)" />
@@ -140,6 +162,14 @@ choice   = in_range.length > 0
           enabled one — a simple withdrawal-order rule (sort candidate sources disabled-first, then by lowest
           APY as a tiebreak) inside the shared redemption payout helper. This is how a disabled token actually
           gets wound down over time, rather than sitting inert forever once flagged.
+        </p>
+        <p className="section-dek" style={{ marginTop: 10 }}>
+          Disabling is <em>not</em> a pause on that source&rsquo;s own price or yield — <code>run_yield_epoch</code>{' '}
+          keeps ticking it (fresh Pyth price, fresh <code>observed_apy_bps</code>, its share of net yield still
+          split into FYC/FFC) for as long as it holds any capital at all. Blocking that tick would freeze its
+          reported APY and stop paying out yield it&rsquo;s still genuinely earning — the two things &ldquo;disabled&rdquo;
+          is actually supposed to change are new deposits (§1) and where new capital routes (§3), not whether the
+          position is still alive.
         </p>
       </div>
 
