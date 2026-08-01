@@ -31,6 +31,9 @@ const NAV: { group: string; items: NavItem[] }[] = [
       { href: '/redemption', num: '11', label: 'Instant & scheduled redemption' },
       { href: '/tranche-swap', num: '12', label: 'jr_to_sr / sr_to_jr' },
       { href: '/yield-sources', num: '13', label: 'Multi-yield-source routing' },
+      { href: '/optimistic-price', num: '14', label: 'Optimistic vs. conservative price' },
+      { href: '/security-review', num: '15', label: 'Security review' },
+      { href: '/llm-handoff', num: '16', label: 'LLM handoff (copy all)' },
     ],
   },
   {

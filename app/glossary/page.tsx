@@ -19,6 +19,9 @@ import {
   blendedApy,
   blendedLoanApy,
   protocolBlendedApy,
+  capFycLoanShare,
+  DEFAULT_MAX_FYC_APY,
+  NET_YIELD_FRACTION,
   YIELD_TARGET,
   YIELD_EPOCH_SECONDS,
   SECONDS_PER_DAY,
@@ -61,6 +64,15 @@ const exampleProtocolBlend = protocolBlendedApy({
   reserveCapital: FYC + FFC - OUT,
   reserveApy: exampleBlend,
 });
+
+// FYC APY cap worked example — same running $600K/$400K/$450K pool, a 15%
+// blended loan book and 3.5% reserve APY (same figures /simulator defaults
+// to), against the default 6% ceiling, so the cap actually engages here —
+// see capFycLoanShare in lib/model.ts and /latex for the derivation.
+const capLoanGrossInterest = (OUT * 0.15) / PERIODS_PER_YEAR;
+const capReserveNetYield = ((FYC + FFC) * 0.035 * NET_YIELD_FRACTION) / PERIODS_PER_YEAR;
+const capReserveSplit = splitBaseYieldTokenYield(capReserveNetYield, FYC, FFC);
+const capExample = capFycLoanShare({ fyc: FYC, ffc: FFC, outstanding: OUT }, capLoanGrossInterest, capReserveSplit.fycShare, DEFAULT_MAX_FYC_APY);
 
 // Staggered-origination accrual worked example — loan A originates "July 3"
 // (day 0), loan B originates 18 days later, "July 21". Proves the O(1)
@@ -291,6 +303,22 @@ const entries: { group: string; items: Entry[] }[] = [
         def: 'The pool’s idle capital (not deployed as loans) earns yield from holding a yield-bearing token — USDY, syrupUSDC, or any other registered source. This yield is split flat pro-rata by tranche size — each tranche gets exactly its share of the combined pool, no curve, no coverage or severity involved. This is the ONE place a simple "your share of the pool" split still applies directly — everywhere else in this redesign, the split is risk-adjusted. The reason: reserve appreciation carries no loan-specific risk, so there is nothing for a first-loss premium to compensate for.',
         formula: <>{'fyc_share = net_yield × FYC / (FYC + FFC)\nffc_share = net_yield − fyc_share'}</>,
         example: <>A $10,000 net reserve-yield month, FYC $600K / FFC $400K: FYC gets <b style={{ color: 'var(--fyc)' }}>{fmtUSD(reserveSplit.fycShare)}</b> (60%), FFC gets <b style={{ color: 'var(--ffc)' }}>{fmtUSD(reserveSplit.ffcShare)}</b> (40%) — exactly their pool share, nothing more.</>,
+      },
+      {
+        term: 'FYC APY cap',
+        symbol: 'MAX_FYC_APY',
+        def: 'An admin-configurable ceiling on FYC’s TOTAL blended APY — loan interest and reserve/yield-token yield combined, not either stream alone. Enforced by throttling ONLY the loan-interest leg (the severity-scaled premium curve above): every period, whatever annualized headroom is left below the cap after subtracting FYC’s reserve-yield share is how much of FYC’s uncapped loan-interest share survives. Anything above that redirects to FFC — not burned, not sent to a protocol wallet — the same "FFC absorbs what FYC doesn’t take" logic the whole coverage/severity curve already runs on. The reserve/yield-token split itself (directly above) is never touched by this: it stays the flat, risk-free pool-share formula it’s always been. The rate is measured against the FYC balance held at the START of the period, before that period’s own mint/redeem activity — the same balance /simulator’s own APY readout divides by — not the (possibly larger, if a mint just landed) balance after. Confirmed bug, now fixed: measuring the cap against the post-mint balance while displaying the rate against the pre-mint one let a same-period FYC mint push the shown APY above the configured ceiling (an 8% cap still showing 8.7%) even though the cap’s own internal math was self-consistent — just against a different number than what got displayed. Edge case worth naming rather than hiding: if FYC’s reserve share ALONE already exceeds the cap in a given period, loan-interest headroom floors at $0 (100% of loan interest redirects to FFC) but the cap stays breached overall anyway — this lever can only claw back loan interest, never reserve yield. See /open-questions.',
+        formula: <>{'reserve_apy         = fyc_reserve_share × PERIODS_PER_YEAR / FYC\nloan_apy_headroom   = max(0, MAX_FYC_APY − reserve_apy)\nloan_share_ceiling  = loan_apy_headroom × FYC / PERIODS_PER_YEAR\nredirected_to_ffc   = max(0, uncapped_loan_fyc_share − loan_share_ceiling)'}</>,
+        example: (
+          <>
+            Same running pool (FYC $600K / FFC $400K / outstanding $450K), a 15% blended loan book and 3.5%
+            reserve APY, against the default <b>{fmtPct(DEFAULT_MAX_FYC_APY, 0)}</b> ceiling: FYC&rsquo;s
+            uncapped loan-interest share would have been <b>{fmtUSD2(capExample.uncappedFycShare)}</b>/period,
+            but the cap redirects <b style={{ color: 'var(--ffc)' }}>{fmtUSD2(capExample.redirectedToFfc)}</b> of
+            that to FFC — FYC keeps <b style={{ color: 'var(--fyc)' }}>{fmtUSD2(capExample.fycShare)}</b> of loan
+            interest this period instead, with its reserve-yield share unaffected.
+          </>
+        ),
       },
     ],
   },

@@ -407,6 +407,115 @@ export function distributeLoanInterest(pool: Pool, grossInterest: number): Distr
 }
 
 // ---------------------------------------------------------------------------
+// FYC APY ceiling — an admin-configurable cap on FYC's TOTAL blended yield.
+// ---------------------------------------------------------------------------
+
+/** Admin-configurable ceiling on FYC's TOTAL blended APY (loan interest +
+ * reserve/yield-token yield combined) — mirrors max_fyc_apy_bps on
+ * PoolState in the Rust proposal, set via a new admin-gated instruction
+ * (set_max_fyc_apy — see /code-diff). This default (6%) is illustrative
+ * only, chosen so the running example actually shows the cap engaging —
+ * an admin sets whatever ceiling the real pool wants. */
+export const DEFAULT_MAX_FYC_APY = 0.06;
+
+export interface CappedLoanInterestResult extends DistributeLoanInterestResult {
+  /** What FYC's loan-interest share would have been with no cap at all —
+   * equal to fycShare whenever capped is false. */
+  uncappedFycShare: number;
+  /** How much of FYC's uncapped loan-interest share got redirected to FFC
+   * this period — 0 if the cap didn't bind. */
+  redirectedToFfc: number;
+  /** Whether the cap actually engaged this period. */
+  capped: boolean;
+}
+
+/**
+ * Caps FYC's TOTAL blended APY by throttling ONLY the loan-interest leg —
+ * deliberately never splitBaseYieldTokenYield above, which stays the flat,
+ * risk-free pool-share formula it's always been. The caller supplies FYC's
+ * reserve-yield share for THIS SAME PERIOD (already computed independently);
+ * whatever annualized headroom is left below maxFycApy after that is how
+ * much of distributeLoanInterest's uncapped fycShare survives. Every dollar
+ * above that redirects to FFC — not burned, not sent to the protocol wallet
+ * — the same "FFC absorbs what FYC doesn't take" logic the whole severity
+ * curve is already built on.
+ *
+ * ```txt
+ * reserve_apy        = fyc_reserve_share × PERIODS_PER_YEAR / fyc_apy_base
+ * loan_apy_headroom  = max(0, max_fyc_apy − reserve_apy)
+ * loan_share_ceiling = loan_apy_headroom × fyc_apy_base / PERIODS_PER_YEAR
+ * ```
+ *
+ * `fycApyBase` — the capital FYC's rate is measured against — is a SEPARATE
+ * argument from `pool.fyc`, not the same number, and its correct value took
+ * TWO fixes to nail down, each closing an opposite exploit:
+ *
+ * 1. Naively passing post-activity `pool.fyc` let a same-period FYC MINT
+ *    enlarge the base the $ ceiling was sized against, while the
+ *    holder-facing APY display divided by the smaller pre-mint balance —
+ *    confirmed: an 8% cap still showed 8.7% realized whenever a mint landed
+ *    the same period as yield distribution.
+ * 2. The first fix (bare pre-activity `fycStart`) closed that, but opened
+ *    the MIRROR exploit: a large same-period FYC REDEMPTION shrinks the
+ *    base AFTER the $ ceiling is sized against the LARGER pre-redeem
+ *    fycStart — landing that dollar amount on the SMALLER post-redeem
+ *    balance hands whoever stays a true per-token rate far above the cap.
+ *    Confirmed via direct simulation during a security review: a 3% cap
+ *    produced an 8.82% true annualized per-token rate after a large
+ *    same-period FYC redemption — a real "redeem-most-then-collect-the-
+ *    windfall-on-the-remainder" attack, not a rounding artifact.
+ *
+ * The caller (lib/simulate.ts) now passes `Math.min(fycStart, pool.fyc)` —
+ * always the SMALLER of what FYC started the period with and what it ends
+ * step 2 (mint/redeem) with — which closes BOTH directions at once: the $
+ * ceiling can never exceed maxFycApy relative to either balance. Defaults
+ * to `pool.fyc` for callers with no separate pre/post-activity distinction
+ * to make (e.g. the static worked examples on /latex and /glossary, where
+ * there's only one snapshot in play). `pool.fyc` (post-activity) still
+ * drives the severity-curve split above (coverage/severity are CURRENT risk
+ * readings, correctly reflecting this period's actual activity) — only the
+ * cap's rate-basis needed the fix. See /security-review for the full
+ * writeup and lib/simulate.ts / verify.ts for the exact reproductions this
+ * is pinned against.
+ *
+ * Edge case, surfaced rather than silently absorbed: if FYC's reserve share
+ * ALONE already exceeds maxFycApy this period, loan-interest headroom floors
+ * at 0 (100% of loan interest redirects to FFC) but the cap stays breached
+ * overall regardless — this lever can only ever claw back loan interest, not
+ * reserve yield. See /open-questions.
+ */
+export function capFycLoanShare(
+  pool: Pool,
+  grossInterest: number,
+  fycReserveShareThisPeriod: number,
+  maxFycApy: number = DEFAULT_MAX_FYC_APY,
+  fycApyBase: number = pool.fyc,
+): CappedLoanInterestResult {
+  const dist = distributeLoanInterest(pool, grossInterest);
+  if (fycApyBase <= 0) {
+    return { ...dist, uncappedFycShare: dist.fycShare, redirectedToFfc: 0, capped: false };
+  }
+
+  const reserveApy = (fycReserveShareThisPeriod * PERIODS_PER_YEAR) / fycApyBase;
+  const loanApyHeadroom = Math.max(0, maxFycApy - reserveApy);
+  const loanShareCeiling = (loanApyHeadroom * fycApyBase) / PERIODS_PER_YEAR;
+
+  if (dist.fycShare <= loanShareCeiling) {
+    return { ...dist, uncappedFycShare: dist.fycShare, redirectedToFfc: 0, capped: false };
+  }
+
+  const redirectedToFfc = dist.fycShare - loanShareCeiling;
+  return {
+    ...dist,
+    fycShare: loanShareCeiling,
+    ffcShare: dist.ffcShare + redirectedToFfc,
+    uncappedFycShare: dist.fycShare,
+    redirectedToFfc,
+    capped: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Amortization — the borrower's true schedule, and the protocol's levelized one.
 // ---------------------------------------------------------------------------
 

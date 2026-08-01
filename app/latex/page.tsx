@@ -27,6 +27,8 @@ import {
   blendedLoanApy,
   protocolBlendedApy,
   pickRebalanceTarget,
+  capFycLoanShare,
+  DEFAULT_MAX_FYC_APY,
   NET_YIELD_FRACTION,
   ALLOCATION_CEILING_FRACTION,
   SEVERITY_REF,
@@ -417,6 +419,44 @@ const ROUND_1: Eq[] = [
       substituted: (v) => {
         const split = splitBaseYieldTokenYield(v.netYield, v.fyc, v.ffc);
         return `\\text{FYC}_{\\text{share}} = ${texDollar(v.netYield)} \\times \\frac{${texDollar(v.fyc)}}{${texDollar(v.fyc)} + ${texDollar(v.ffc)}} = ${texDollar(split.fycShare, 2)}, \\qquad \\text{FFC}_{\\text{share}} = ${texDollar(split.ffcShare, 2)}`;
+      },
+    },
+  },
+  {
+    label: 'FYC APY cap — throttling the loan-interest leg',
+    tex: `${wrapVar('FycLoanShareCapped', '\\text{FYC}_{\\text{loan}}')} = \\min\\!\\left(${wrapVar('UncappedFycLoanShare', '\\text{FYC}_{\\text{loan}}^{\\text{uncapped}}')},\\; \\max\\!\\left(0,\\; ${wrapVar('MAX_FYC_APY', '\\text{MAX\\_FYC\\_APY}')} - \\frac{${wrapVar('FycReserveShare', '\\text{FYC}_{\\text{reserve}}')} \\times ${wrapVar('PERIODS_PER_YEAR', '\\text{PERIODS\\_PER\\_YEAR}')}}{${wrapVar('FYC', '\\text{FYC}')}}\\right) \\times \\frac{${wrapVar('FYC', '\\text{FYC}')}}{${wrapVar('PERIODS_PER_YEAR', '\\text{PERIODS\\_PER\\_YEAR}')}}\\right)`,
+    note: 'An admin-configurable ceiling on FYC’s TOTAL blended APY, enforced by throttling ONLY the loan-interest leg — the reserve/yield-token split above is never touched. Whatever this min() doesn’t give FYC redirects straight to FFC (see capFycLoanShare in lib/model.ts) — not burned, not sent to a protocol wallet. The inner max(0, …) matters at the edges: if FYC’s reserve share alone already exceeds MAX_FYC_APY this period, the ceiling term goes to exactly $0 rather than negative, so 100% of loan interest redirects to FFC — but the cap stays breached overall regardless, since this lever can only claw back loan interest, never reserve yield. FYC here is the balance held at the START of the period, before that period’s own mint/redeem activity — capFycLoanShare takes this as a separate fycApyBase argument (defaulting to the current balance when there’s no such distinction to make), because measuring the cap against a post-mint balance while displaying the rate against the pre-mint one is a confirmed real bug that let a same-period FYC mint push the shown APY above the configured ceiling.',
+    glossaryTerm: 'FYC APY cap',
+    codeFile: 'pinochio/src/helpers/curve.rs',
+    tool: { label: '▶ See it live on /simulator', href: '/simulator' },
+    worked: {
+      inputs: [
+        { key: 'fyc', label: 'FYC', value: FYC, step: 10000, prefix: '$' },
+        { key: 'ffc', label: 'FFC', value: FFC, step: 10000, prefix: '$' },
+        { key: 'outstanding', label: 'Outstanding', value: OUT, step: 10000, prefix: '$' },
+        { key: 'loanGrossInterest', label: 'Loan gross interest this period', value: 5548, step: 100, prefix: '$' },
+        { key: 'fycReserveShare', label: "FYC's reserve share this period", value: 1467, step: 50, prefix: '$' },
+        { key: 'maxFycApyPct', label: 'MAX_FYC_APY', value: DEFAULT_MAX_FYC_APY * 100, step: 0.5, suffix: '%' },
+      ],
+      compute: (v) => {
+        const capped = capFycLoanShare({ fyc: v.fyc, ffc: v.ffc, outstanding: v.outstanding }, v.loanGrossInterest, v.fycReserveShare, v.maxFycApyPct / 100);
+        return capped.capped
+          ? [
+              { label: 'Cap engaged', value: 'Yes', color: 'var(--ffc)' },
+              { label: 'FYC loan share (capped)', value: fmtUSD2(capped.fycShare), color: 'var(--fyc)' },
+              { label: 'Redirected to FFC', value: fmtUSD2(capped.redirectedToFfc), color: 'var(--ffc)' },
+            ]
+          : [
+              { label: 'Cap engaged', value: 'No — under ceiling', color: 'var(--good)' },
+              { label: 'FYC loan share', value: fmtUSD2(capped.fycShare), color: 'var(--fyc)' },
+            ];
+      },
+      substituted: (v) => {
+        const capped = capFycLoanShare({ fyc: v.fyc, ffc: v.ffc, outstanding: v.outstanding }, v.loanGrossInterest, v.fycReserveShare, v.maxFycApyPct / 100);
+        const reserveApy = (v.fycReserveShare * PERIODS_PER_YEAR) / v.fyc;
+        const headroom = Math.max(0, v.maxFycApyPct / 100 - reserveApy);
+        const ceiling = (headroom * v.fyc) / PERIODS_PER_YEAR;
+        return `\\text{FYC}_{\\text{loan}} = \\min\\!\\left(${texDollar(capped.uncappedFycShare, 2)},\\; \\max\\!\\left(0,\\; ${texPct(v.maxFycApyPct / 100, 1)} - ${texPct(reserveApy, 2)}\\right) \\times \\frac{${texDollar(v.fyc)}}{${texNum(PERIODS_PER_YEAR, 4)}}\\right) = \\min\\!\\left(${texDollar(capped.uncappedFycShare, 2)},\\; ${texDollar(ceiling, 2)}\\right) = ${texDollar(capped.fycShare, 2)}`;
       },
     },
   },

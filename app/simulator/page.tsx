@@ -31,6 +31,7 @@ function SimulatorPageInner() {
     initialFyc, setInitialFyc,
     initialFfc, setInitialFfc,
     reserveApy, setReserveApy,
+    maxFycApy, setMaxFycApy,
     periods, setPeriods,
     originations, setOriginations,
     defaults, setDefaults,
@@ -208,13 +209,14 @@ function SimulatorPageInner() {
         initialFyc,
         initialFfc,
         reserveApy,
+        maxFycApy,
         periods: effectivePeriods,
         originations: effectiveOriginations,
         defaults: effectiveDefaults,
         trancheActivity: effectiveTrancheActivity,
         severityGateMax: severityGateFraction,
       }),
-    [initialFyc, initialFfc, reserveApy, effectivePeriods, effectiveOriginations, effectiveDefaults, effectiveTrancheActivity, severityGateFraction],
+    [initialFyc, initialFfc, reserveApy, maxFycApy, effectivePeriods, effectiveOriginations, effectiveDefaults, effectiveTrancheActivity, severityGateFraction],
   );
 
   useEffect(() => {
@@ -310,6 +312,13 @@ function SimulatorPageInner() {
             step={1}
             suffix="%"
           />
+          <NumberField
+            label="Max FYC APY (cap)"
+            value={maxFycApy * 100}
+            onChange={(v) => setMaxFycApy(Math.max(0, v) / 100)}
+            step={0.5}
+            suffix="%"
+          />
         </div>
         <p className="section-dek" style={{ fontSize: 11.5, marginTop: 10, marginBottom: 0 }}>
           How long the whole run plays out — also the window new originations and mint/redeem activity can land
@@ -317,6 +326,15 @@ function SimulatorPageInner() {
           run still automatically extends past this if a loan originated near the end needs more months to
           amortize to $0 — see below. The severity gate is shared with{' '}
           <Link href="/explorer">Coverage &amp; curve</Link> — changing it here changes it there too.
+        </p>
+        <p className="section-dek" style={{ fontSize: 11.5, marginTop: 6, marginBottom: 0 }}>
+          Max FYC APY is an admin-configurable ceiling on FYC&rsquo;s TOTAL blended yield (loan interest +
+          reserve/yield-token appreciation combined) — every dollar loan interest would otherwise have paid FYC
+          past that ceiling redirects to FFC instead; the reserve/yield-token split itself is never touched.
+          Measured against the FYC balance held at the START of the period (before that period&rsquo;s own
+          mint/redeem activity) — the same balance the APY readout below is measured against — so a same-period
+          FYC mint can never make the displayed rate read above the cap. See <Link href="/latex">/latex</Link>{' '}
+          for the formula and <Link href="/glossary">/glossary</Link> for the full writeup.
         </p>
       </Card>
 
@@ -637,6 +655,12 @@ function SimulatorPageInner() {
             label="Protocol APY — blended (loans + reserve)"
             value={`${step.protocolBlendedApyPct.toFixed(2)}%`}
             sub={`capital-weighted: ${fmtUSD(step.outstanding)} loans @ ${step.loanObservedApyPct.toFixed(2)}% + ${fmtUSD(step.reserve)} reserve @ ${step.reserveObservedApyPct.toFixed(2)}% — see protocolBlendedApy`}
+          />
+          <Readout
+            label={`Max FYC APY (cap) — ${(maxFycApy * 100).toFixed(1)}% ceiling`}
+            value={step.fycApyCapped ? `ENGAGED — $${step.redirectedToFfcFromCap.toFixed(2)} redirected` : 'not engaged'}
+            sub={`$${step.redirectedToFfcFromCapCum.toFixed(2)} redirected to FFC cumulative — reserve/yield-token split is never touched, only loan interest`}
+            color={step.fycApyCapped ? 'var(--ffc)' : undefined}
           />
           <Readout
             label="Instant liquidity (ELB) — FYC / FFC"

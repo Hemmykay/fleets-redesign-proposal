@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useState, type ReactNode, type Dispatch, type SetStateAction } from 'react';
 import type { OriginationEvent, DefaultEvent, TrancheActivityEvent } from '@/lib/simulate';
-import { ORIGINATION_FEE_FRACTION } from '@/lib/model';
+import { ORIGINATION_FEE_FRACTION, DEFAULT_MAX_FYC_APY } from '@/lib/model';
 import { nextId } from '@/lib/idCounter';
 
 /**
@@ -26,6 +26,11 @@ interface SimulatorStateValue {
   setInitialFfc: (v: number) => void;
   reserveApy: number;
   setReserveApy: (v: number) => void;
+  /** Admin-configurable ceiling on FYC's TOTAL blended APY — see
+   * capFycLoanShare in lib/model.ts. Only the loan-interest split is ever
+   * throttled to enforce it. */
+  maxFycApy: number;
+  setMaxFycApy: (v: number) => void;
   periods: number;
   setPeriods: (v: number) => void;
   originations: OriginationEvent[];
@@ -98,6 +103,7 @@ export function SimulatorStateProvider({ children }: { children: ReactNode }) {
   const [initialFyc, setInitialFyc] = useState(600000);
   const [initialFfc, setInitialFfc] = useState(400000);
   const [reserveApy, setReserveApy] = useState(0.035);
+  const [maxFycApy, setMaxFycApy] = useState(DEFAULT_MAX_FYC_APY);
   const [periods, setPeriods] = useState(36);
   const [originations, setOriginations] = useState<OriginationEvent[]>(DEFAULT_ORIGINATIONS);
   const [defaults, setDefaults] = useState<DefaultEvent[]>(DEFAULT_DEFAULTS);
@@ -136,6 +142,7 @@ export function SimulatorStateProvider({ children }: { children: ReactNode }) {
         initialFyc, setInitialFyc,
         initialFfc, setInitialFfc,
         reserveApy, setReserveApy,
+        maxFycApy, setMaxFycApy,
         periods, setPeriods,
         originations, setOriginations,
         defaults, setDefaults,

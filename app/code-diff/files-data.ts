@@ -265,6 +265,22 @@ pub const YIELD_TARGET_MAX_BPS: u64 = 700;   // 7.00%
 /// is never the reason a legitimate earmark expires early.
 pub const EARMARK_EXPIRY_SECS: i64 = 120 * SECONDS_PER_DAY;
 
+// --- FYC APY cap (round 3) — see helpers/waterfall.rs::distribute_loan_interest,
+// instructions/set_max_fyc_apy.rs. ---
+
+/// Sanity ceiling on what set_max_fyc_apy.rs will accept — NOT the actual
+/// working cap (that's PoolState.max_fyc_apy_bps, admin-set per pool, 0 =
+/// uncapped). Added after a security review found the original version of
+/// this instruction had no bound at all: distribute_loan_interest's ceiling
+/// math is mul_div_u64(headroom_bps, fyc.v_tranche, BPS_DENOMINATOR), and
+/// headroom_bps derives from max_fyc_apy_bps — an admin fat-fingering (or a
+/// malicious admin deliberately setting) something near u64::MAX, combined
+/// with a large fyc.v_tranche, pushes the u128 intermediate uncomfortably
+/// close to its own ceiling. 100_000 bps (1,000% APY) is comfortably above
+/// any real ceiling an admin would ever actually want while leaving no
+/// realistic path to that overflow — see /security-review.
+pub const MAX_FYC_APY_BPS: u64 = 100_000;
+
 /// 365-day year — matches observed_source_apy_bps's own annualization
 /// factor (not a flat ×12 over 30-day periods). Used by run_yield_epoch.rs
 /// to derive each YieldSourceState's observed_apy_bps.
@@ -447,7 +463,7 @@ macro_rules! require_keys_eq {
   path: "pinochio/src/state.rs",
   status: "M",
   category: "pinocchio",
-  why: "LoanAccount gets one new field — levelized_interest, the flat per-period figure computed once at origination. This grows the repr(C) struct by 8 bytes, so LOAN_SPACE changes and any already-deployed LoanAccount PDAs need a migration (realloc + backfill) before this ships — flagged directly in /open-questions on the design tool. PoolState gets one new byte, yield_source_count, carved out of what was _padding — the struct's total size is unchanged, so this one is NOT a breaking change (existing accounts already read that byte as zero, which is the correct starting count). PoolState ALSO gets three new fields — loan_accrual_rate/loan_accrual_checkpoint/loan_accrual_updated_ts, a reward-per-second accumulator that makes compute_optimistic_price's loan-interest estimate a real per-active-loan accrual instead of the old cap-based proxy (see helpers/allocation.rs) — this IS a breaking 24-byte growth, same realloc + backfill migration story as LoanAccount's field, not folded into the free-padding trick above. New: YieldSourceState, one PDA per registered yield-bearing reserve token — see helpers/allocation.rs and instructions/initialize_yield_source.rs. (Its impl_account_io! registration and the RedemptionRequest struct/load-save-helpers tail of the real file are outside this excerpt — same as they were before this round.) Round 2 (redemption/liquidity): PoolState gains pending_fyc_redemptions and earmarked_loan_capital (both breaking, same realloc+backfill story); YieldSourceState gains observed_apy_bps (not breaking — nothing is deployed against its layout yet) and repurposes is_active as the disable-source flag; new EarmarkRecord PDA carries each individual earmark's own expiry so a forgotten cancel_earmark can't permanently over-reserve capital.",
+  why: "LoanAccount gets one new field — levelized_interest, the flat per-period figure computed once at origination. This grows the repr(C) struct by 8 bytes, so LOAN_SPACE changes and any already-deployed LoanAccount PDAs need a migration (realloc + backfill) before this ships — flagged directly in /open-questions on the design tool. PoolState gets one new byte, yield_source_count, carved out of what was _padding — the struct's total size is unchanged, so this one is NOT a breaking change (existing accounts already read that byte as zero, which is the correct starting count). PoolState ALSO gets three new fields — loan_accrual_rate/loan_accrual_checkpoint/loan_accrual_updated_ts, a reward-per-second accumulator that makes compute_optimistic_price's loan-interest estimate a real per-active-loan accrual instead of the old cap-based proxy (see helpers/allocation.rs) — this IS a breaking 24-byte growth, same realloc + backfill migration story as LoanAccount's field, not folded into the free-padding trick above. New: YieldSourceState, one PDA per registered yield-bearing reserve token — see helpers/allocation.rs and instructions/initialize_yield_source.rs. (Its impl_account_io! registration and the RedemptionRequest struct/load-save-helpers tail of the real file are outside this excerpt — same as they were before this round.) Round 2 (redemption/liquidity): PoolState gains pending_fyc_redemptions and earmarked_loan_capital (both breaking, same realloc+backfill story); YieldSourceState gains observed_apy_bps (not breaking — nothing is deployed against its layout yet) and repurposes is_active as the disable-source flag; new EarmarkRecord PDA carries each individual earmark's own expiry so a forgotten cancel_earmark can't permanently over-reserve capital. Round 3 (FYC APY cap): PoolState gains max_fyc_apy_bps (admin-configurable ceiling on FYC's TOTAL blended APY — set via the new set_max_fyc_apy.rs, see helpers/waterfall.rs::distribute_loan_interest) and last_observed_base_apy_bps (the PRIMARY reserve's own observed-APY figure, mirroring YieldSourceState.observed_apy_bps but for the original single-reserve slot, refreshed every instructions/run_yield_epoch.rs 5-account tick) — both breaking, same realloc+backfill story, backfilling both to 0 is safe: max_fyc_apy_bps == 0 is the deliberate 'uncapped' sentinel (preserves today's real behavior for every existing pool until an admin opts in), and the cap logic short-circuits before ever reading last_observed_base_apy_bps while uncapped.",
   suggestions: [
     "Two concurrent equity-received events can each pass the origination liquidity gate before either one's earmark_loan_capital call actually lands, both drawing on the same slice of ELB — EARMARK_EXPIRY_SECS + sweep_expired_earmark bounds the damage but doesn't prevent it; the real fix is serializing equity-received processing in the backend, not something this PDA layout alone can guarantee.",
     "loan_ref on EarmarkRecord is an opaque off-chain id supplied by the backend — nothing on-chain currently verifies it corresponds to a real application-pipeline loan. Low risk since only admin can call earmark_loan_capital, but worth a decision on whether that's sufficient.",
@@ -724,6 +740,32 @@ pub struct PoolState {
     pub accelerated_redemption_fee_bps: u64,
     pub max_standard_redemption_fee_bps: u64,
     pub max_accelerated_redemption_fee_bps: u64,
+    /// NEW (round 3) — admin-configurable ceiling on FYC's TOTAL blended APY
+    /// (loan interest + reserve/yield-token yield combined), set via
+    /// instructions/set_max_fyc_apy.rs. 0 is a deliberate sentinel meaning
+    /// "uncapped" — every already-deployed pool backfills to 0 and keeps
+    /// today's real behavior exactly until an admin explicitly opts in.
+    /// Enforced in helpers/waterfall.rs::distribute_loan_interest by
+    /// throttling ONLY the loan-interest leg; the reserve/yield-token split
+    /// (split_base_yield_token_yield) is never touched. BREAKING — same
+    /// realloc + backfill (= 0) story as the fields above.
+    pub max_fyc_apy_bps: u64,
+    /// NEW (round 3) — the PRIMARY reserve's own last-observed annualized
+    /// APY, mirroring YieldSourceState.observed_apy_bps (which only covers
+    /// ADDITIONAL registered sources) for the original single-reserve slot.
+    /// Refreshed every instructions/run_yield_epoch.rs 5-account tick, using
+    /// the identical price-delta method observed_source_apy_bps already
+    /// uses. distribute_loan_interest reads this directly instead of
+    /// re-deriving an annualized rate from a dollar figure at repay time —
+    /// repay_loan.rs and run_yield_epoch.rs are async, unrelated-cadence
+    /// instructions (a borrower can repay at any moment; the epoch tick
+    /// runs on its own admin-triggered schedule), so there is no "this same
+    /// period's reserve share" to hand distribute_loan_interest the way the
+    /// design tool's own lib/model.ts simulator can (it steps both streams
+    /// together every 30-day period) — reading the pool's last observed
+    /// rate is the honest on-chain equivalent. BREAKING — same
+    /// realloc + backfill (= 0) story as the fields above.
+    pub last_observed_base_apy_bps: u64,
     pub protocol_fee_recipient: RawKey,
     pub epoch_interval_secs: i64,
 
@@ -1229,7 +1271,7 @@ mod tests {
   path: "pinochio/src/helpers/waterfall.rs",
   status: "M",
   category: "pinocchio",
-  why: "distribute_loan_interest's fyc_target/residual split — the actual bug: FYC's rate can invert below its own reserve-only baseline once FFC is oversized relative to the epoch cap — is replaced with the severity-scaled curve from curve.rs. Signature drops base_yield_token_price/now_ts: coverage and severity are read directly off pool + tranche state, no epoch snapshot needed. apply_default_waterfall is also redesigned into a three-tier order: FFC absorbs the loss first, same as before; once FFC is exhausted the remainder now burns FYC tokens held in the insurance wallet (a real loss absorption — v_tranche and total_supply both drop by the burned amount) instead of the old version's post-hoc price smoothing; only once the insurance fund's own FYC is exhausted does the loss finally reduce general fyc.v_tranche. approve_default.rs needs no changes — it already discards apply_default_waterfall's return value.",
+  why: "distribute_loan_interest's fyc_target/residual split — the actual bug: FYC's rate can invert below its own reserve-only baseline once FFC is oversized relative to the epoch cap — is replaced with the severity-scaled curve from curve.rs. Signature drops base_yield_token_price/now_ts: coverage and severity are read directly off pool + tranche state, no epoch snapshot needed. apply_default_waterfall is also redesigned into a three-tier order: FFC absorbs the loss first, same as before; once FFC is exhausted the remainder now burns FYC tokens held in the insurance wallet (a real loss absorption — v_tranche and total_supply both drop by the burned amount) instead of the old version's post-hoc price smoothing; only once the insurance fund's own FYC is exhausted does the loss finally reduce general fyc.v_tranche. approve_default.rs needs no changes — it already discards apply_default_waterfall's return value. Round 3: distribute_loan_interest now also enforces max_fyc_apy_bps (PoolState) — after the severity-curve split above, FYC's loan-interest share is clamped so its TOTAL blended APY (this share plus pool.last_observed_base_apy_bps) never exceeds the admin-configured ceiling; every dollar clamped off redirects to ffc_share, never burned or sent to a wallet. 0 (the sentinel/backfill value) means uncapped, so this is a no-op for every pool until an admin calls the new set_max_fyc_apy.rs. Mirrors capFycLoanShare in the design tool's lib/model.ts, with one deliberate divergence: the design tool passes an explicit per-period reserve-share dollar figure since its simulator steps loan and reserve accrual together; on-chain, repay_loan.rs (this function's real caller) and run_yield_epoch.rs fire on unrelated cadences, so this reads pool.last_observed_base_apy_bps — an already-annualized rate, refreshed every epoch tick — directly instead.",
   original: `//! Yield distribution + default waterfall + price refresh + pause check
 //! (mirrors helpers/waterfall.rs).
 
@@ -1356,7 +1398,7 @@ pub fn ensure_not_paused(pool: &PoolState) -> Result<(), ProgramError> {
 //! (mirrors helpers/waterfall.rs).
 
 use pinocchio::error::ProgramError;
-use crate::constants::PRECISION;
+use crate::constants::{BPS_DENOMINATOR, PRECISION, SECONDS_PER_PERIOD, SECONDS_PER_YEAR};
 use crate::errors::FleetError;
 use crate::helpers::curve::k_from_coverage_and_severity;
 use crate::helpers::fees::{mint_fee_value_into_fyc, split_gross_yield};
@@ -1403,6 +1445,33 @@ pub fn distribute_loan_interest(
     let denom = checked_add_u64(fyc.v_tranche, k_ffc)?;
     let ffc_share = if denom == 0 { 0 } else { mul_div_u64(split.net_yield, k_ffc, denom)? };
     let fyc_share = split.net_yield.saturating_sub(ffc_share);
+
+    // NEW (round 3) — FYC APY cap. 0 is the "uncapped" sentinel: skip
+    // entirely rather than reading last_observed_base_apy_bps for no
+    // reason. Throttles ONLY this loan-interest leg; the reserve/yield-
+    // token split (split_base_yield_token_yield below) is never touched.
+    let (fyc_share, ffc_share) = if pool.max_fyc_apy_bps == 0 {
+        (fyc_share, ffc_share)
+    } else {
+        // Headroom is whatever's left of the ceiling after FYC's reserve
+        // share (already annualized, unlike fyc_share/ffc_share above which
+        // are still per-period dollar amounts) — floors at 0 rather than
+        // going negative, matching capFycLoanShare's max(0, ...) in
+        // lib/model.ts: if the reserve leg alone already exceeds the cap,
+        // 100% of loan interest redirects to FFC, but the cap stays
+        // breached overall regardless (this lever can't claw back reserve
+        // yield, only loan interest).
+        let headroom_bps = pool.max_fyc_apy_bps.saturating_sub(pool.last_observed_base_apy_bps);
+        let annualized_ceiling = mul_div_u64(headroom_bps, fyc.v_tranche, BPS_DENOMINATOR)?;
+        let loan_share_ceiling = mul_div_u64(annualized_ceiling, SECONDS_PER_PERIOD as u64, SECONDS_PER_YEAR as u64)?;
+
+        if fyc_share <= loan_share_ceiling {
+            (fyc_share, ffc_share)
+        } else {
+            let redirected_to_ffc = fyc_share - loan_share_ceiling;
+            (loan_share_ceiling, checked_add_u64(ffc_share, redirected_to_ffc)?)
+        }
+    };
 
     fyc.v_tranche = checked_add_u64(fyc.v_tranche, fyc_share)?;
     ffc.v_tranche = checked_add_u64(ffc.v_tranche, ffc_share)?;
@@ -3241,7 +3310,7 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
   path: "pinochio/src/instructions/run_yield_epoch.rs",
   status: "M",
   category: "pinocchio",
-  why: "Backward compatible, not a breaking rewrite: called with the original 5 accounts, this ticks the pool's primary reserve exactly as before, byte-for-byte the same math, still writing PoolState's own c_tokens/last_base_yield_token_price/last_epoch_ts — every existing off-chain caller keeps working unmodified. Called with 6 accounts — a yield_source account inserted before the oracle — it ticks THAT registered YieldSourceState (USDY, syrupUSDC, ...) instead, using the same observed_source_apy_bps-style 24h-epoch math from helpers/allocation.rs, without ever touching PoolState. Adding a source's epoch tick is a longer accounts array, not a new instruction or a new tag. v_pool for the fee/split math still only sums the primary reserve either way — the same tracked helpers/pricing.rs follow-up noted on helpers/allocation.rs — so this file doesn't silently claim more coverage than it has. Round 2: the 6-account branch now also writes the derived rate into YieldSourceState.observed_apy_bps, feeding helpers/liquidity.rs::blended_apy — WHICH source new capital should route into (the [3%, 3.5%, 7%] target-range logic) is deliberately kept an off-chain preview computation, not folded into this instruction; this instruction only ever ticks the one source it's given. Deliberately NOT gated on is_active: a disabled source still gets ticked here (fresh Pyth price, fresh observed_apy_bps, its net yield still split into FYC/FFC) for as long as it holds capital — disabling only stops new deposits (deposit_yield_token.rs) and new-capital routing (helpers/liquidity.rs::pick_rebalance_target), not the source's own yield accrual. Gating the tick on is_active would have frozen a disabled source's reported APY and stopped distributing yield it's still genuinely earning, which is exactly the bug helpers/liquidity.rs::blended_apy_bps was also fixed to stop assuming (see that file's own why).",
+  why: "Backward compatible, not a breaking rewrite: called with the original 5 accounts, this ticks the pool's primary reserve exactly as before, byte-for-byte the same math, still writing PoolState's own c_tokens/last_base_yield_token_price/last_epoch_ts — every existing off-chain caller keeps working unmodified. Called with 6 accounts — a yield_source account inserted before the oracle — it ticks THAT registered YieldSourceState (USDY, syrupUSDC, ...) instead, using the same observed_source_apy_bps-style 24h-epoch math from helpers/allocation.rs, without ever touching PoolState. Adding a source's epoch tick is a longer accounts array, not a new instruction or a new tag. v_pool for the fee/split math still only sums the primary reserve either way — the same tracked helpers/pricing.rs follow-up noted on helpers/allocation.rs — so this file doesn't silently claim more coverage than it has. Round 2: the 6-account branch now also writes the derived rate into YieldSourceState.observed_apy_bps, feeding helpers/liquidity.rs::blended_apy — WHICH source new capital should route into (the [3%, 3.5%, 7%] target-range logic) is deliberately kept an off-chain preview computation, not folded into this instruction; this instruction only ever ticks the one source it's given. Deliberately NOT gated on is_active: a disabled source still gets ticked here (fresh Pyth price, fresh observed_apy_bps, its net yield still split into FYC/FFC) for as long as it holds capital — disabling only stops new deposits (deposit_yield_token.rs) and new-capital routing (helpers/liquidity.rs::pick_rebalance_target), not the source's own yield accrual. Gating the tick on is_active would have frozen a disabled source's reported APY and stopped distributing yield it's still genuinely earning, which is exactly the bug helpers/liquidity.rs::blended_apy_bps was also fixed to stop assuming (see that file's own why). Round 3: the 5-account (primary reserve) branch NOW ALSO writes an annualized rate into the new PoolState.last_observed_base_apy_bps, the same way the 6-account branch already does for YieldSourceState.observed_apy_bps — this WAS the one asymmetry left after round 2 (every additional source tracked its own observed APY; the original primary reserve never did), and it's what lets distribute_loan_interest (helpers/waterfall.rs) enforce the new FYC APY cap without needing its own oracle read at repay time.",
   original: `//! Distribute newly-accrued base-yield-token yield (epoch tick).
 //! Accounts: [authority, pool, fyc, ffc, base_yield_token_oracle]
 //! Data: ()
@@ -3380,8 +3449,15 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
         save_yield_source(yield_source, &ys)?;
         (net_yield, fee_value, v_pool)
     } else {
-        // UNCHANGED — 5-account call, the pool's original primary reserve,
-        // identical math to the pre-redesign version of this file.
+        // Mostly UNCHANGED — 5-account call, the pool's original primary
+        // reserve, identical yield/fee math to the pre-redesign version of
+        // this file. CHANGED (round 3): also refreshes
+        // last_observed_base_apy_bps, the SAME annualization method the
+        // 6-account branch above already uses for YieldSourceState.
+        // observed_apy_bps — this is what distribute_loan_interest
+        // (helpers/waterfall.rs) reads to enforce the FYC APY cap, since
+        // repay_loan.rs (an unrelated-cadence instruction) has no other way
+        // to know "the reserve's current rate" without its own oracle read.
         let [base_oracle] = rest else { return Err(FleetError::InvalidAccountData.into()); };
         if p.base_yield_token_oracle != *base_oracle.address().as_array() {
             return Err(FleetError::Unauthorized.into());
@@ -3394,6 +3470,14 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
         let net_yield = mul_div_u64(gross_yield, NET_YIELD_BPS, BPS_DENOMINATOR)?;
         let fee_value = gross_yield.saturating_sub(net_yield);
         let v_pool = compute_v_pool(&p, price_now)?;
+
+        // NEW (round 3) — see the comment above this branch.
+        let elapsed = (now_ts - p.last_epoch_ts).max(1);
+        p.last_observed_base_apy_bps = mul_div_u64(
+            mul_div_u64(price_delta, BPS_DENOMINATOR, price_last.max(1))?,
+            SECONDS_PER_YEAR as u64,
+            elapsed as u64,
+        )?;
 
         p.last_base_yield_token_price = price_now;
         p.last_epoch_ts = now_ts;
@@ -3895,7 +3979,7 @@ pub fn process_instruction(
   path: "pinochio/src/instructions/mod.rs",
   status: "M",
   category: "pinocchio",
-  why: "Registers the three new instruction modules — initialize_yield_source, deposit_yield_token, burn_insurance_for_ffc — alphabetically, matching this file's existing convention. Round 2 registers five more: jr_to_sr, sr_to_jr, disable_yield_source, earmark_loan_capital, cancel_earmark.",
+  why: "Registers the three new instruction modules — initialize_yield_source, deposit_yield_token, burn_insurance_for_ffc — alphabetically, matching this file's existing convention. Round 2 registers five more: jr_to_sr, sr_to_jr, disable_yield_source, earmark_loan_capital, cancel_earmark. Round 3 registers one more: set_max_fyc_apy.",
   original: `pub mod accelerated_redeem;
 pub mod approve_default;
 pub mod deposit;
@@ -3933,6 +4017,7 @@ pub mod recalculate_allocation;
 pub mod record_recovery;
 pub mod repay_loan;
 pub mod run_yield_epoch;
+pub mod set_max_fyc_apy;
 pub mod set_paused;
 pub mod set_redemption_fees;
 pub mod sr_to_jr;
@@ -4331,6 +4416,54 @@ pub fn process(accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
     if ys.pool != *pool.address().as_array() { return Err(FleetError::Unauthorized.into()); }
     ys.is_active = 0;
     save_yield_source(yield_source, &ys)?;
+    Ok(())
+}`
+},
+{
+  path: "pinochio/src/instructions/set_max_fyc_apy.rs",
+  status: "U",
+  category: "pinocchio",
+  why: "New instruction (round 3) — admin-only, sets PoolState.max_fyc_apy_bps (see state.rs), the ceiling helpers/waterfall.rs::distribute_loan_interest enforces on FYC's TOTAL blended APY. 0 (the value every already-deployed pool backfills to) means uncapped, so a pool's real behavior is completely unchanged until an admin actually calls this. Structurally the smallest possible admin setter — mirrors disable_yield_source.rs's shape (assert_admin, one field write, no PDA) rather than set_redemption_fees.rs's multi-field validation. CORRECTED after a security review: this originally shipped with no bound on the accepted value at all (the claim here used to be 'no upper/lower bound to enforce beyond what u64 already gives for free') — now rejects anything above the new MAX_FYC_APY_BPS (constants.rs), since distribute_loan_interest's ceiling math multiplies this value against fyc.v_tranche in a u128 intermediate that a near-u64::MAX input could push uncomfortably close to overflowing. See /security-review. Like the other round-2/3 admin instructions in this file (disable_yield_source, earmark_loan_capital, jr_to_sr, sr_to_jr), its ix_tag discriminator and process_instruction dispatch arm follow the same convention as INITIALIZE_YIELD_SOURCE/DEPOSIT_YIELD_TOKEN/BURN_INSURANCE_FOR_FFC (lib.rs) but aren't re-shown in this excerpt — same known gap already flagged for those instructions, not new here.",
+  original: "",
+  proposed: `//! Admin-only: sets FYC's total-blended-APY ceiling (max_fyc_apy_bps on
+//! PoolState). 0 means "uncapped" — the sentinel every already-deployed
+//! pool starts at after migration, so THIS instruction is what actually
+//! turns the cap on; nothing changes for anyone until an admin calls it.
+//! New this round — see helpers/waterfall.rs::distribute_loan_interest,
+//! /simulator, and /glossary#fyc-apy-cap.
+//!
+//! CHANGED (security review) — rejects any value above MAX_FYC_APY_BPS
+//! (constants.rs). The original version accepted any u64 at all; a value
+//! near u64::MAX, combined with a large fyc.v_tranche, pushes
+//! distribute_loan_interest's mul_div_u64(headroom_bps, fyc.v_tranche,
+//! BPS_DENOMINATOR) uncomfortably close to overflowing its own u128
+//! intermediate. See /security-review.
+//!
+//! Accounts: [admin, pool]
+//! Data: max_fyc_apy_bps (u64)
+
+use pinocchio::{account::AccountView, ProgramResult};
+
+use crate::constants::MAX_FYC_APY_BPS;
+use crate::errors::FleetError;
+use crate::pda::*;
+use crate::state::{load_pool_mut, save_pool};
+
+pub fn process(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [admin, pool, ..] = accounts else {
+        return Err(FleetError::InvalidAccountData.into());
+    };
+    require_signer(admin)?;
+    let mut p = load_pool_mut(pool)?;
+    if !p.assert_admin(admin.address().as_array()) { return Err(FleetError::Unauthorized.into()); }
+
+    let mut c = 0;
+    let max_fyc_apy_bps = read_u64(data, &mut c)?;
+    if max_fyc_apy_bps > MAX_FYC_APY_BPS {
+        return Err(FleetError::InvalidInstructionData.into());
+    }
+    p.max_fyc_apy_bps = max_fyc_apy_bps;
+    save_pool(pool, &p)?;
     Ok(())
 }`
 },

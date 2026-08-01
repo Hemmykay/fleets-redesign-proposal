@@ -397,4 +397,25 @@ export const VARIABLE_DEFS: Record<string, VariableDef> = {
     symbol: 'AllocationCeilingFraction',
     def: 'The fraction of total pool value that’s allowed to be deployed as loans — 80%, the complement of ReserveTargetFraction.',
   },
+  MAX_FYC_APY: {
+    symbol: 'MAX_FYC_APY',
+    def: 'An admin-configurable ceiling on FYC’s TOTAL blended APY (loan interest + reserve/yield-token yield combined) — 6% by default here, whatever the admin sets on-chain in the real proposal.',
+    derivation: 'Enforced by throttling ONLY the loan-interest split, never the reserve/yield-token split — see capFycLoanShare in lib/model.ts.',
+    glossaryTerm: 'FYC APY cap',
+  },
+  FycReserveShare: {
+    symbol: 'FYC_reserve',
+    def: 'FYC’s share of the reserve/yield-token yield THIS PERIOD — computed independently by splitBaseYieldTokenYield, unaffected by the loan-interest cap.',
+    glossaryTerm: 'Reserve / yield-token yield split',
+  },
+  UncappedFycLoanShare: {
+    symbol: 'FYC_loan (uncapped)',
+    def: 'What FYC’s loan-interest share would have been with no APY cap at all — the severity-curve output (distributeLoanInterest) before capFycLoanShare gets a chance to throttle it.',
+    glossaryTerm: 'k (premium multiplier)',
+  },
+  FycLoanShareCapped: {
+    symbol: 'FYC_loan',
+    def: 'FYC’s ACTUAL loan-interest share this period, after the APY cap — equal to the uncapped share whenever the cap doesn’t bind, otherwise clamped down to whatever headroom is left below MAX_FYC_APY once FYC’s reserve share is accounted for.',
+    glossaryTerm: 'FYC APY cap',
+  },
 };

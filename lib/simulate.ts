@@ -27,7 +27,8 @@ import {
   severityOf,
   coverageOf,
   splitBaseYieldTokenYield,
-  distributeLoanInterest,
+  capFycLoanShare,
+  DEFAULT_MAX_FYC_APY,
   splitElb,
   instantRedemptionFeeBps,
   instantRedemptionFeeSplit,
@@ -123,6 +124,11 @@ export interface ScenarioConfig {
   /** Capital reserved against equity-received-but-not-yet-originated loans —
    * see EarmarkEvent. Defaults to none. */
   earmarkEvents?: EarmarkEvent[];
+  /** Admin-configurable ceiling on FYC's TOTAL blended APY (loan interest +
+   * reserve/yield-token yield) — see capFycLoanShare in lib/model.ts.
+   * Defaults to DEFAULT_MAX_FYC_APY. Only the loan-interest leg is ever
+   * throttled to enforce it; the reserve/yield-token split is untouched. */
+  maxFycApy?: number;
 }
 
 interface ActiveLoan {
@@ -147,7 +153,8 @@ export interface SimEvent {
     | 'redeem'
     | 'redeem-blocked'
     | 'redeem-scheduled'
-    | 'redeem-processed';
+    | 'redeem-processed'
+    | 'fyc-apy-capped';
   detail: string;
 }
 
@@ -182,6 +189,13 @@ export interface SimStep {
   ffcReserveShare: number;
   fycLoanShare: number;
   ffcLoanShare: number;
+  /** Whether the FYC APY cap redirected any of FYC's loan-interest share to
+   * FFC this period — see capFycLoanShare in lib/model.ts. */
+  fycApyCapped: boolean;
+  /** How much of FYC's uncapped loan-interest share got redirected to FFC
+   * this period — 0 whenever fycApyCapped is false. */
+  redirectedToFfcFromCap: number;
+  redirectedToFfcFromCapCum: number;
   fycCumYield: number;
   ffcCumYield: number;
   fycApyAnnualized: number;
@@ -266,6 +280,12 @@ export function runSimulation(config: ScenarioConfig): SimResult {
   // visibility. See splitOriginationFee in lib/model.ts.
   let originationFeeProtocolCum = 0;
   let originationFeeInsuranceCum = 0;
+  // FYC APY cap — cumulative loan-interest redirected to FFC because FYC's
+  // total blended yield would otherwise have exceeded maxFycApy. Purely
+  // informational (fyc/ffc themselves already reflect the redirect via
+  // capFycLoanShare's ffcShare) — see /simulator.
+  let redirectedToFfcFromCapCum = 0;
+  const maxFycApy = config.maxFycApy ?? DEFAULT_MAX_FYC_APY;
 
   // Token supply — set at genesis so price starts at exactly $1.00, then
   // mutated by mint/redeem events. The 15% yield fee IS minted into FYC
@@ -338,6 +358,9 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     ffcReserveShare: 0,
     fycLoanShare: 0,
     ffcLoanShare: 0,
+    fycApyCapped: false,
+    redirectedToFfcFromCap: 0,
+    redirectedToFfcFromCapCum: 0,
     fycCumYield: 0,
     ffcCumYield: 0,
     fycApyAnnualized: 0,
@@ -468,14 +491,40 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     const reserveGrossYieldEstimate = reserveBeforeActivity * (reserveObservedApy / PERIODS_PER_YEAR);
     const reserveNetYieldEstimate = reserveGrossYieldEstimate * NET_YIELD_FRACTION;
     const reserveSplitEstimate = splitBaseYieldTokenYield(reserveNetYieldEstimate, fyc, ffc);
-    const loanDistEstimate = distributeLoanInterest({ fyc, ffc, outstanding }, loanGrossInterest);
+    // fycApyBase left at its default (pool.fyc) deliberately — this estimate
+    // runs before step 2's activity, so `fyc` here already IS the
+    // pre-activity balance; no separate base to thread through. See the
+    // step 4 call below for the case where they actually diverge.
+    const loanDistEstimate = capFycLoanShare(
+      { fyc, ffc, outstanding },
+      loanGrossInterest,
+      reserveSplitEstimate.fycShare,
+      maxFycApy,
+    );
     const fycYieldEstimate = reserveSplitEstimate.fycShare + loanDistEstimate.fycShare;
     const ffcYieldEstimate = reserveSplitEstimate.ffcShare + loanDistEstimate.ffcShare;
-    // Snapshot for display (SimStep.fycOptimisticPrice/ffcOptimisticPrice)
-    // — the price a mint at the very TOP of this period, before any of its
-    // own activity, would have paid.
+    // The price a mint at the very TOP of this period, before any of its own
+    // activity, would have paid — used below (step 2) to price THIS
+    // period's own mints, unchanged. ALSO, confirmed bug fix: this exact
+    // number is the state at the END of period `period - 1` (nothing has
+    // happened between "end of period-1" and "top of period" — they're the
+    // same instant), so it backfills steps[period-1].fycOptimisticPrice
+    // rather than becoming steps[period]'s own optimistic price below. Before
+    // this fix, steps[period].fycOptimisticPrice held THIS number while
+    // steps[period].fycPrice (conservative) was measured a full period
+    // LATER — after period's own yield had already landed — so the chart
+    // was comparing two different moments in time, not "mint vs. redeem
+    // right now." Whenever a mid-period mint enlarged the reserve/loan base
+    // the ACTUAL yield (step 3/4 below) collects against beyond what this
+    // stale estimate anticipated, conservative could read ABOVE optimistic
+    // for that period — confirmed via direct simulation across 20 random
+    // seeds, dozens of violations. See /optimistic-price for the full
+    // derivation and worked proof, and lib/model.ts's capFycLoanShare doc
+    // comment for the sibling fix this one is built on the same lesson from.
     const fycOptimisticPriceAtOpen = fycSupply > 0 ? (fyc + fycYieldEstimate) / fycSupply : 1;
     const ffcOptimisticPriceAtOpen = ffcSupply > 0 ? (ffc + ffcYieldEstimate) / ffcSupply : 1;
+    steps[period - 1].fycOptimisticPrice = fycOptimisticPriceAtOpen;
+    steps[period - 1].ffcOptimisticPrice = ffcOptimisticPriceAtOpen;
 
     // 2. Mint/redeem activity — processed before this period's yield
     // actually gets collected (steps 3/4), so capital arriving this period
@@ -588,8 +637,50 @@ export function runSimulation(config: ScenarioConfig): SimResult {
 
     // 4. Loan interest — the severity-scaled premium curve, for real
     // (post-activity fyc/ffc/outstanding — may differ slightly from the
-    // step 1e estimate for the same reason as reserve yield above).
-    const loanDist = distributeLoanInterest({ fyc, ffc, outstanding }, loanGrossInterest);
+    // step 1e estimate for the same reason as reserve yield above). Then
+    // capped against maxFycApy: FYC's total blended APY (this loan share +
+    // reserveSplit.fycShare above) can never exceed the admin-configured
+    // ceiling — any excess redirects to FFC. See capFycLoanShare.
+    //
+    // CHANGED (bug fix, twice over) — fycApyBase is Math.min(fycStart, fyc),
+    // not either one alone. First pass used bare fycStart to fix a MINT
+    // exploit: passing post-activity fyc let a same-period mint enlarge the
+    // base the $ ceiling was sized against, so the displayed
+    // fycApyAnnualized (divided by the smaller pre-mint fycStart) could
+    // read above maxFycApy even though the cap's own math was consistent
+    // against a different, larger number.
+    //
+    // But bare fycStart alone opens the MIRROR exploit on a same-period
+    // REDEEM: if FYC redeems heavily in step 2, fycStart (pre-redeem) is
+    // the LARGER number — sizing the $ ceiling against it, then landing
+    // that dollar amount on the SMALLER post-redeem `fyc`, hands whoever
+    // stayed a per-token appreciation rate far above the cap. Confirmed by
+    // direct simulation: a 3% cap produced an 8.82% true annualized
+    // per-token rate for remaining holders after a large same-period FYC
+    // redemption — a real, exploitable "redeem-most-then-collect-the-
+    // windfall-on-the-remainder" attack, not a rounding artifact.
+    //
+    // Math.min(fycStart, fyc) closes both directions at once: the $ ceiling
+    // is always sized against whichever balance — the one FYC started the
+    // period with, or the one it ends step 2 with — is SMALLER, so it can
+    // never exceed maxFycApy relative to either. See /optimistic-price and
+    // /security-review for the full writeup and the regression tests this
+    // is pinned against.
+    const loanDist = capFycLoanShare(
+      { fyc, ffc, outstanding },
+      loanGrossInterest,
+      reserveSplit.fycShare,
+      maxFycApy,
+      Math.min(fycStart, fyc),
+    );
+    if (loanDist.capped) {
+      redirectedToFfcFromCapCum += loanDist.redirectedToFfc;
+      events.push({
+        period,
+        kind: 'fyc-apy-capped',
+        detail: `FYC APY cap engaged (${(maxFycApy * 100).toFixed(1)}% ceiling) — $${loanDist.redirectedToFfc.toFixed(2)} of loan interest redirected from FYC to FFC this period`,
+      });
+    }
     // Defense in depth alongside BALANCE_DUST above: never divide by a
     // sub-dollar outstanding figure, however it got that small. A ratio
     // against a fraction of a cent isn't a meaningful "APY," it's noise.
@@ -740,6 +831,9 @@ export function runSimulation(config: ScenarioConfig): SimResult {
       ffcReserveShare: reserveSplit.ffcShare,
       fycLoanShare: loanDist.fycShare,
       ffcLoanShare: loanDist.ffcShare,
+      fycApyCapped: loanDist.capped,
+      redirectedToFfcFromCap: loanDist.redirectedToFfc,
+      redirectedToFfcFromCapCum,
       fycCumYield,
       ffcCumYield,
       fycApyAnnualized: fycStart > 0 ? (fycYield / fycStart) * PERIODS_PER_YEAR * 100 : 0,
@@ -765,13 +859,50 @@ export function runSimulation(config: ScenarioConfig): SimResult {
       yieldFeeInsurance: yieldFeeSplit.insuranceValueUsd,
       yieldFeeProtocolCum,
       yieldFeeInsuranceCum,
-      fycOptimisticPrice: fycOptimisticPriceAtOpen,
-      ffcOptimisticPrice: ffcOptimisticPriceAtOpen,
+      // Placeholder — overwritten either by the NEXT iteration's backfill
+      // above (the normal case) or, for the very last period, by the
+      // closing pass right after this loop. Defaults to this SAME period's
+      // conservative price rather than anything else, so if either backfill
+      // path were ever somehow skipped, this fails toward "optimistic ==
+      // conservative" (the boundary-safe value) instead of a wrong number.
+      fycOptimisticPrice: fyc / fycSupply,
+      ffcOptimisticPrice: ffc / ffcSupply,
       originationFeeProtocol,
       originationFeeInsurance,
       originationFeeProtocolCum,
       originationFeeInsuranceCum,
     });
+  }
+
+  // The last period's optimistic price never gets backfilled by a "next
+  // iteration" (there isn't one) — do the identical step-1d/1e computation
+  // once here, off the final post-loop state, to close it out. `outstanding`
+  // was block-scoped to the loop above, so it's re-derived from `loans`
+  // (still in scope, holding its final mutated balances) exactly the way
+  // step 1 itself computes it.
+  if (steps.length > 0) {
+    const finalOutstanding = loans.reduce((sum, l) => sum + l.balance, 0);
+    const finalReservePriceNext = reservePrice * (1 + config.reserveApy / PERIODS_PER_YEAR);
+    const finalReserveObservedApy =
+      reservePrice > 0 ? (finalReservePriceNext / reservePrice - 1) * PERIODS_PER_YEAR : 0;
+    const finalReserveBeforeActivity = Math.max(0, fyc + ffc - finalOutstanding);
+    const finalReserveGrossYieldEstimate = finalReserveBeforeActivity * (finalReserveObservedApy / PERIODS_PER_YEAR);
+    const finalReserveNetYieldEstimate = finalReserveGrossYieldEstimate * NET_YIELD_FRACTION;
+    const finalReserveSplitEstimate = splitBaseYieldTokenYield(finalReserveNetYieldEstimate, fyc, ffc);
+    const finalLoanGrossInterest = loans
+      .filter((l) => l.balance > 0)
+      .reduce((sum, l) => sum + l.levelizedInterestAmt, 0);
+    const finalLoanDistEstimate = capFycLoanShare(
+      { fyc, ffc, outstanding: finalOutstanding },
+      finalLoanGrossInterest,
+      finalReserveSplitEstimate.fycShare,
+      maxFycApy,
+    );
+    const finalFycYieldEstimate = finalReserveSplitEstimate.fycShare + finalLoanDistEstimate.fycShare;
+    const finalFfcYieldEstimate = finalReserveSplitEstimate.ffcShare + finalLoanDistEstimate.ffcShare;
+    const lastStep = steps[steps.length - 1];
+    lastStep.fycOptimisticPrice = fycSupply > 0 ? (fyc + finalFycYieldEstimate) / fycSupply : 1;
+    lastStep.ffcOptimisticPrice = ffcSupply > 0 ? (ffc + finalFfcYieldEstimate) / ffcSupply : 1;
   }
 
   return { steps, events };
