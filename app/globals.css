@@ -394,6 +394,14 @@ input.ffc-slide { --accent-c: var(--ffc); }
 .wrap-toggle:hover { background: var(--surface); color: var(--text-primary); border-color: var(--border-strong); }
 .wrap-toggle.active { background: var(--accent-wash); color: var(--accent); border-color: var(--accent); }
 
+.tab-bar { display: flex; gap: 6px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
+.tab-btn {
+  background: transparent; color: var(--text-secondary); border: none; border-bottom: 2px solid transparent;
+  font-family: var(--font-mono); font-size: 13px; padding: 10px 4px; margin-bottom: -1px; cursor: pointer;
+}
+.tab-btn:hover { color: var(--text-primary); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
 /* ---------- implementation table ---------- */
 table.impl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 table.impl th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); padding: 0 12px 10px; border-bottom: 1px solid var(--border); font-weight: 600; }

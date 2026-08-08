@@ -144,8 +144,9 @@ export const COVERAGE_WEIGHT_FLOOR = 0.5;
 export const SEVERITY_MINT_FLOOR = 0.02;
 
 /** Above this severity, loan origination is blocked — replaces the old flat
- * 80% coverage floor. */
-export const SEVERITY_GATE_MAX = 0.2;
+ * 80% coverage floor. Set to 50% for capital efficiency: FYC can absorb up
+ * to half its own value in the worst case before new origination stops. */
+export const SEVERITY_GATE_MAX = 0.5;
 
 export interface Pool {
   /** FYC — senior tranche value, in USD. */
@@ -194,7 +195,7 @@ export function coverageOf(outstanding: number, ffc: number): number {
  * ```
  */
 export function severityOf(outstanding: number, ffc: number, fyc: number): number {
-  if (fyc <= 0) return 0;
+  if (fyc <= 0) return outstanding <= ffc ? 0 : Infinity;
   return Math.max(0, outstanding - ffc) / fyc;
 }
 
@@ -269,7 +270,21 @@ export interface CurveResult {
   coveragePct: number;
 }
 
-/** Curve output for a REAL pool state (outstanding, ffc, fyc all known). */
+/**
+ * Curve output for a REAL pool state (outstanding, ffc, fyc all known).
+ *
+ * DELIBERATELY reads the real `ffc`, not `ffc - pendingFfcRedemptions` —
+ * discussed and resolved after a first pass netted out pending redemptions
+ * here too, matching assertOriginationAllowed. The gate and this curve
+ * answer different questions: the gate is forward-looking (protecting a
+ * NEW loan's whole future life against capital that's scheduled to leave).
+ * This curve is about who bore risk THIS period — FFC pending redemption
+ * is still fully in the pool, still earning yield, and still first-loss
+ * (a default before the redemption processes still marks down the price
+ * the pending redeemer is eventually paid at) until the moment it's
+ * actually paid out. Netting it here would underpay capital that was, in
+ * fact, fully at risk. See /open-questions.
+ */
 export function curveAtActual(outstanding: number, ffc: number, fyc: number): CurveResult {
   const coveragePct = coverageOf(outstanding, ffc) * 100;
   const severity = severityOf(outstanding, ffc, fyc);
@@ -474,9 +489,8 @@ export interface CappedLoanInterestResult extends DistributeLoanInterestResult {
  * there's only one snapshot in play). `pool.fyc` (post-activity) still
  * drives the severity-curve split above (coverage/severity are CURRENT risk
  * readings, correctly reflecting this period's actual activity) — only the
- * cap's rate-basis needed the fix. See /security-review for the full
- * writeup and lib/simulate.ts / verify.ts for the exact reproductions this
- * is pinned against.
+ * cap's rate-basis needed the fix. See lib/simulate.ts / verify.ts for the
+ * exact reproductions this is pinned against.
  *
  * Edge case, surfaced rather than silently absorbed: if FYC's reserve share
  * ALONE already exceeds maxFycApy this period, loan-interest headroom floors
@@ -558,6 +572,62 @@ export function levelizedInterest(principal: number, aprAnnual: number, termMont
   const m = monthlyPayment(principal, aprAnnual, termMonths);
   const totalInterest = m * termMonths - principal;
   return totalInterest / termMonths;
+}
+
+// ---------------------------------------------------------------------------
+// Loan lifecycle: grace -> cure -> default (round 5) — mirrors
+// pinochio/src/helpers/loan_lifecycle.rs exactly. Purely time-derived from
+// nextDueTs; no stored status for grace/cure, ever — see /loan-lifecycle.
+// ---------------------------------------------------------------------------
+
+/** A missed payment starts GRACE automatically — no bump, still counted in
+ * optimistic pricing, still presumed likely to pay. */
+export const GRACE_PERIOD_DAYS = 15;
+/** CURE starts automatically the instant GRACE_PERIOD_DAYS elapses — APR
+ * bump applies, loan should stop counting toward optimistic pricing. Own
+ * duration from cure entry, not from the original due date. Total time from
+ * a missed payment to DEFAULTED is GRACE_PERIOD_DAYS + CURE_PERIOD_DAYS = 30
+ * days, deliberately equal to one period — a loan is never more than one
+ * payment behind when it defaults. */
+export const CURE_PERIOD_DAYS = 15;
+/** 1.25x the loan's own APR, applied only during CURE. */
+export const CURE_APR_MULTIPLIER = 1.25;
+
+/** Whole days past due; 0 if not yet due or exactly on time. Anchored to
+ * nextDueTs itself, never to whenever some check happens to run. */
+export function daysLate(nowTs: number, nextDueTs: number): number {
+  if (nowTs <= nextDueTs) return 0;
+  return Math.floor((nowTs - nextDueTs) / SECONDS_PER_DAY);
+}
+
+/** GRACE: late, but no APR bump yet. */
+export function isInGrace(nowTs: number, nextDueTs: number): boolean {
+  const d = daysLate(nowTs, nextDueTs);
+  return d > 0 && d <= GRACE_PERIOD_DAYS;
+}
+
+/** CURE: the APR bump applies, and the loan should stop counting toward
+ * optimistic pricing. */
+export function isInCure(nowTs: number, nextDueTs: number): boolean {
+  const d = daysLate(nowTs, nextDueTs);
+  return d > GRACE_PERIOD_DAYS && d <= GRACE_PERIOD_DAYS + CURE_PERIOD_DAYS;
+}
+
+/** Past the full 30-day grace+cure window with no payment — eligible for
+ * finalize_default; repay_loan must refuse a payment from here on. */
+export function isDefaultable(nowTs: number, nextDueTs: number): boolean {
+  return daysLate(nowTs, nextDueTs) > GRACE_PERIOD_DAYS + CURE_PERIOD_DAYS;
+}
+
+/** The extra interest CURE adds on top of levelizedInterest for one period:
+ * true declining-balance interest at the bumped (1.25x) rate, minus the
+ * same at the loan's own real rate — off the actual outstanding balance,
+ * for one period. NOT day-counted, NOT scaled against the whole remaining
+ * term — just "what would this one period cost at the bumped rate
+ * instead," added onto the pool-facing levelized figure alongside it. */
+export function cureFee(currentBalance: number, aprAnnual: number): number {
+  const bumpedApr = aprAnnual * CURE_APR_MULTIPLIER;
+  return periodInterest(currentBalance, bumpedApr) - periodInterest(currentBalance, aprAnnual);
 }
 
 export interface AmortRow {
@@ -799,30 +869,34 @@ export interface InstantFeeResult {
 }
 
 /**
- * Instant-redemption fee — the ENDPOINT-RATE formula, as specified: the fee
- * rate charged on the WHOLE redemption is read off where the amount lands
- * within the tranche's available instant liquidity, then applied flat to
- * the full amount.
+ * Instant-redemption fee — the SPLIT-INVARIANT INTEGRAL formula: the
+ * closed-form integral of the marginal rate `fee_min + (fee_max-fee_min) ×
+ * (u/elb_tranche)` over `u ∈ [0, amount]`, rather than the endpoint rate
+ * (the marginal rate AT `u = amount`) applied flat to the whole redemption.
  *
  * ```txt
- *                                amount
- * fee_bps = fee_min + ------------------------------ × (fee_max − fee_min)
- *                          elb_tranche
+ *                                    amount²
+ * fee = fee_min·amount + (fee_max − fee_min) × ------------
+ *                                              2·elb_tranche
  * ```
  *
- * Worked example (the one this was specified against): $40K ELB_FYC,
- * redeeming $20K (the midpoint) lands fee_bps at the midpoint of [10, 50] —
- * 30 bps.
+ * FIXED (security review): the previous endpoint-rate formula —
+ * `fee_bps = fee_min + (amount/elb_tranche) × (fee_max−fee_min)`, applied
+ * flat to the whole amount — was split-gameable: because elb_tranche is
+ * read live, splitting one redemption into several smaller ones against the
+ * same elb_tranche converged the *average* rate paid toward fee_min (probe:
+ * one $50K redeem at $100K ELB paid $150; two $25K redeems at the same ELB
+ * paid $100 total — a 33% discount for no economic change). Integrating the
+ * marginal rate over the actual amount redeemed, instead of reading a
+ * single endpoint rate and applying it flat, removes that gap. See
+ * /open-questions and /redemption for the full writeup — this exactly
+ * halves the quadratic term the old endpoint formula charged.
  *
- * NOTE — split-gameable, deliberately not fixed here: because elb_tranche is
- * read live, splitting one large redemption into several smaller ones (in
- * one transaction, before anything else can move elb_tranche) converges the
- * *average* rate paid toward fee_min. The split-invariant fix is the closed-
- * form integral of this same marginal rate over [0, amount] —
- * `fee = fee_min·amount + (fee_max−fee_min)·amount²/(2·elb_tranche)`, exactly
- * half the quadratic term this endpoint formula charges. That variant is
- * recommended for production but changes this worked example's numbers, so
- * it isn't silently substituted here — see /open-questions.
+ * Worked example: $40K ELB_FYC, redeeming $20K (the midpoint) now costs
+ * `10 + 40×(20000/40000)/2 = 20 bps` (was 30 bps under the endpoint
+ * formula) — lower for any single non-split redemption, since the integral
+ * is the AVERAGE rate over the path from 0 to amount, not the rate at the
+ * endpoint.
  *
  * Redeeming more than the tranche's available instant liquidity isn't
  * discounted or partially served — it's simply not eligible for the instant
@@ -833,8 +907,9 @@ export function instantRedemptionFeeBps(tranche: Tranche, amount: number, elbTra
   if (amount <= 0 || elbTranche <= 0 || amount > elbTranche) {
     return { allowed: false, feeBps: 0, feeValue: 0, netPayout: 0 };
   }
-  const feeBps = min + (amount / elbTranche) * (max - min);
-  const feeValue = (amount * feeBps) / 10_000;
+  const spread = max - min;
+  const feeValue = (min * amount) / 10_000 + (spread * amount * amount) / (2 * elbTranche * 10_000);
+  const feeBps = amount > 0 ? (feeValue * 10_000) / amount : 0;
   return { allowed: true, feeBps, feeValue, netPayout: amount - feeValue };
 }
 
@@ -964,6 +1039,55 @@ export function blendedApy(sources: YieldSource[]): number {
   const total = active.reduce((s, x) => s + x.capitalUsd, 0);
   if (total <= 0) return 0;
   return active.reduce((s, x) => s + x.capitalUsd * x.apy, 0) / total;
+}
+
+/**
+ * Total USD capital currently deployed across every registered yield
+ * source — the TS mirror of the round-6 pricing.rs fix ("pass all
+ * accounts": every v_pool read sums ALL registered YieldSourceStates, not
+ * just the primary reserve). Sums to 0 for an empty list; a source with
+ * capitalUsd=0 contributes nothing, same skip blendedApy above relies on.
+ *
+ * Extracted from /optimistic-price's own inline `sources.reduce(...)` so
+ * this is the single shared definition this file's header comment already
+ * promises ("nothing here is duplicated in a component") — that page is
+ * this function's only caller.
+ *
+ * NOT the same computation as the real compute_v_pool (helpers/pricing.rs),
+ * which also adds outstanding loan principal on top of reserve capital.
+ * This function is just the reserve-capital term; callers add outstanding
+ * separately if they need the full pool-wide total (see Pool.outstanding).
+ *
+ * Decision 1 (drop the double-counted realized_losses subtraction,
+ * pricing.rs) has NO equivalent fix needed here: this simulator (see
+ * lib/simulate.ts's defaultLoss handling) reduces `fyc`/`ffc`/the loan
+ * book's own balances directly at default time and never keeps a separate
+ * running realized_losses ledger to subtract a second time — the bug
+ * pricing.rs had literally can't occur at this abstraction level, not
+ * because it was fixed, but because nothing here was ever counting on that
+ * second value to begin with.
+ */
+export function totalReserveCapital(sources: { capitalUsd: number }[]): number {
+  return sources.reduce((sum, s) => sum + s.capitalUsd, 0);
+}
+
+/**
+ * Total gross reserve/yield-token yield accrued THIS PERIOD, summed across
+ * every registered source — the reserve-side twin of rollupLoanAccrual's
+ * loan-side accrual sum, and the TS mirror of compute_optimistic_price's
+ * (helpers/allocation.rs) per-source yield-delta logic generalized from one
+ * source to every registered one. Each source contributes its own
+ * capital-weighted share of its own stated APY; a source with capitalUsd=0
+ * contributes nothing.
+ *
+ * ```txt
+ *                        capital_i × apy_i
+ * gross_this_period = Σ  ------------------
+ *                        PERIODS_PER_YEAR
+ * ```
+ */
+export function totalReserveGrossYieldThisPeriod(sources: { capitalUsd: number; apy: number }[]): number {
+  return sources.reduce((sum, s) => sum + (s.capitalUsd * s.apy) / PERIODS_PER_YEAR, 0);
 }
 
 export interface RebalanceChoice {

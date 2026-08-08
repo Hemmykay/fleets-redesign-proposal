@@ -60,7 +60,7 @@ export default function ChangesPage() {
                 file="helpers/curve.rs (new)"
               />
               <Item
-                b={<><b>The 80% coverage gate — reopened and replaced.</b> Was explicitly kept in the written proposal (§4, &ldquo;considered for removal, explicitly rejected&rdquo;) — that decision is now reversed. <code>assert_origination_allowed</code> blocks origination on projected severity exceeding 20%, not projected coverage falling below 80%, so a large FYC unlocks real origination capacity without needing more FFC.</>}
+                b={<><b>The 80% coverage gate — reopened and replaced.</b> Was explicitly kept in the written proposal (§4, &ldquo;considered for removal, explicitly rejected&rdquo;) — that decision is now reversed. <code>assert_origination_allowed</code> blocks origination on projected severity exceeding 50%, not projected coverage falling below 80%, so a large FYC unlocks real origination capacity without needing more FFC.</>}
                 file="helpers/coverage.rs — assert_origination_allowed"
               />
               <Item

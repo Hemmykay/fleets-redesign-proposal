@@ -39,9 +39,11 @@ export default function OpenQuestionsPage() {
             side effect of the algebra.
           </Q>
           <Q>
-            <b>K_MIN (1.25), SEVERITY_REF (8%), COVERAGE_WEIGHT_FLOOR (0.5), SEVERITY_MINT_FLOOR (2%), and
-            SEVERITY_GATE_MAX (20%) are all illustrative,</b> not signed off. SEVERITY_REF and
-            SEVERITY_GATE_MAX were originally pinned equal (both 20%, tied to the old 80% floor&rsquo;s
+            <b>K_MIN (1.25), SEVERITY_REF (8%), COVERAGE_WEIGHT_FLOOR (0.5), and SEVERITY_MINT_FLOOR (2%)
+            are all illustrative,</b> not signed off. <b>SEVERITY_GATE_MAX is decided, at 50%</b> —
+            chosen for capital efficiency; both <code>lib/model.ts</code> and the Rust proposal&rsquo;s
+            <code>constants.rs</code> are aligned to it. SEVERITY_REF and SEVERITY_GATE_MAX were
+            originally pinned equal (both 20% at the time, tied to the old 80% floor&rsquo;s
             complement) but that made full premium only ever engage right at the edge of the origination gate
             — nearly every allowed pool state was earning a diluted, scaled-down rate. They were deliberately
             decoupled and SEVERITY_REF lowered so the premium ramps in well before the gate.
@@ -90,51 +92,60 @@ export default function OpenQuestionsPage() {
             invents value.
           </Q>
           <Q>
-            <b>compute_v_pool still only sums the primary reserve&rsquo;s tokens,</b> not any additional
-            registered <code>YieldSourceState</code>. Pool-wide totals — the loan-allocation cap, TVL, and
-            optimistic price&rsquo;s own split denominator — all under-count value sitting in a second or third
-            source until that function itself is migrated to sum across all of them. Flagged everywhere it
-            matters on <code>/code-diff</code>, not fixed in this round.
+            <b>FIXED (round 6): compute_v_pool used to only sum the primary reserve&rsquo;s tokens,</b> not any
+            additional registered <code>YieldSourceState</code> — pool-wide totals (the loan-allocation cap, TVL,
+            and optimistic price&rsquo;s own split denominator) under-counted value sitting in a second or third
+            source. Now takes an explicit <code>sources</code>/<code>source_prices</code> slice and sums across
+            all of them — &ldquo;pass all accounts,&rdquo; decided over a running-total/checkpoint alternative
+            (see <code>helpers/reserve_checkpoint_sketch.rs</code> on <code>/code-diff</code>, written up but
+            deliberately not wired in). <code>deposit.rs</code>, <code>deposit_yield_token.rs</code>, and{' '}
+            <code>run_yield_epoch.rs</code> all grow an optional trailing tail of <code>(yield_source, oracle)</code>{' '}
+            account pairs to supply it. See <code>/code-diff</code> and{' '}
+            <code>totalReserveCapital</code>/<code>totalReserveGrossYieldThisPeriod</code> in{' '}
+            <code>lib/model.ts</code> for the TS-side mirror, pinned by <code>lib/verify.ts</code>.
           </Q>
           <Q>
-            <b>A loan stops counting toward optimistic-price accrual at flag_pending_default, not the later
-            approve_default</b> — deliberately conservative, since by the time a loan is flagged it&rsquo;s
-            already gone through a full cure period of non-payment. But <code>flag_pending_default</code> is
-            its own explicit call, gated on <code>CURE_PERIOD_DAYS</code> having elapsed, not something that
-            fires automatically the moment a loan goes delinquent. If nobody calls it promptly, an already-overdue
-            loan keeps counting toward the accrual rate for however long that gap lasts — worth deciding whether
-            this needs a permissionless keeper incentive rather than relying on someone remembering to call it.
+            <b>Still open (P2): cure-stage accrual exclusion needs someone to call finalize_default.</b>{' '}
+            Stale as of round 5 — this used to describe the old admin-staged{' '}
+            <code>flag_pending_default</code>/<code>approve_default</code> two-call flow; both{' '}
+            <code>approve_default</code> and its staged status values are gone as of round 8 (nothing is
+            deployed yet, so there was no reason to keep them as deprecated scaffolding — see{' '}
+            <code>state.rs</code> on <code>/code-diff</code>). The real gap is narrower but still real:{' '}
+            <code>finalize_default.rs</code> (renamed from <code>flag_pending_default.rs</code>, same
+            ix_tag) is <em>permissionless</em> — during CURE it pulls a loan&rsquo;s contribution out of{' '}
+            <code>pool.loan_accrual_rate</code>, and past the full 30-day grace+cure window it finalizes to{' '}
+            <code>DEFAULTED</code> — but nothing calls it automatically. If nobody calls it promptly once a
+            loan enters CURE, that loan keeps inflating the accrual estimate (and, past day 30, keeps sitting
+            un-finalized) for however long the gap lasts. Anyone can call it — there&rsquo;s no admin
+            gatekeeping left — but &ldquo;anyone can&rdquo; isn&rsquo;t the same as &ldquo;someone will&rdquo;;
+            worth deciding whether this needs a keeper incentive (e.g. a small bounty paid to whoever calls
+            it) rather than relying on someone remembering to.
           </Q>
           <Q>
-            <b>compute_v_pool / compute_v_pool_true likely double-count a default,</b> pre-existing in the real
-            contract, not introduced by this redesign. <code>approve_default.rs</code> does two independent
-            things to the same <code>PoolState</code> in the same instruction:{' '}
-            <code>outstanding_principal -= loan.current_balance</code> AND{' '}
-            <code>realized_losses += confirmed_gross_loss</code>. Since <code>compute_v_pool</code> is{' '}
-            <code>c_tokens×price + outstanding_principal − realized_losses</code>, and nothing nets these two
+            <b>FIXED (round 6): compute_v_pool / compute_v_pool_true used to double-count a default,</b>{' '}
+            pre-existing in the real contract, not introduced by this redesign. The old real{' '}
+            <code>approve_default.rs</code> did two independent things to the same <code>PoolState</code> in the
+            same instruction: <code>outstanding_principal -= loan.current_balance</code> AND{' '}
+            <code>realized_losses += confirmed_gross_loss</code>. Since the old <code>compute_v_pool</code> was{' '}
+            <code>c_tokens×price + outstanding_principal − realized_losses</code>, and nothing netted these two
             terms against each other, a fully-written-off loan (where <code>confirmed_gross_loss ≈
-            current_balance</code>) gets subtracted from pool value twice — once through the vanished{' '}
-            <code>outstanding_principal</code>, once through the grown <code>realized_losses</code>.{' '}
-            <code>record_recovery.rs</code> only ever decrements <code>realized_losses</code> by the recovered
-            amount, capped at one recovery per loan — it never restores <code>outstanding_principal</code>, so
-            any unrecovered portion stays double-counted permanently, understating every tranche&rsquo;s price
-            from that point on. Confirmed by reading every read/write site of both fields; not fixed in this
-            round — the likely correct fix is dropping the <code>− realized_losses</code> term from{' '}
-            <code>compute_v_pool</code>/<code>compute_v_pool_true</code> entirely, since <code>
-            outstanding_principal</code> already reflects the loss, but that touches every caller of those two
-            functions (already several, across this redesign) and deserves its own pass before shipping.
+            current_balance</code>) got subtracted from pool value twice. Fixed by dropping the{' '}
+            <code>− realized_losses</code> term from both functions entirely — <code>outstanding_principal</code>{' '}
+            already reflects the loss, so nothing else needs to. <code>realized_losses</code> the FIELD is
+            unchanged and still written by <code>resell_defaulted_loan.rs</code> /{' '}
+            <code>relist_defaulted_loan.rs</code> — it&rsquo;s kept as an analytics-only lifetime-losses counter,
+            just no longer read by pricing. See <code>helpers/pricing.rs</code> on <code>/code-diff</code>.
           </Q>
           <Q>
-            <b>The instant-redemption fee formula is split-gameable, and the fix is deliberately not
-            adopted.</b> <code>fee_bps = fee_min + (amount/elb_tranche) × (fee_max−fee_min)</code>, applied flat
-            to the whole amount, is quadratic in <code>amount</code> but not split-invariant — splitting one
-            redemption into several smaller ones inside a single transaction (before anything else can move{' '}
-            <code>elb_tranche</code>) converges the average rate paid toward <code>fee_min</code>. The
-            split-invariant fix is charging the closed-form integral of the same marginal rate instead —{' '}
-            <code>fee = fee_min·amount + (fee_max−fee_min)·amount²/(2·elb_tranche)</code>, exactly half this
-            formula&rsquo;s quadratic term. Not adopted here because it changes the worked example&rsquo;s
-            numbers (the one this was specified against); recommended as the production hardening. See{' '}
-            <a href="/redemption">/redemption</a>.
+            <b>FIXED (security review): the instant-redemption fee formula was split-gameable — now uses the
+            split-invariant integral.</b> The old <code>fee_bps = fee_min + (amount/elb_tranche) ×
+            (fee_max−fee_min)</code>, applied flat to the whole amount, was quadratic in <code>amount</code> but
+            not split-invariant — splitting one redemption into several smaller ones inside a single
+            transaction (before anything else can move <code>elb_tranche</code>) converged the average rate
+            paid toward <code>fee_min</code>. Both <code>lib/model.ts</code> and the on-chain proposal now
+            charge the closed-form integral of the same marginal rate instead —{' '}
+            <code>fee = fee_min·amount + (fee_max−fee_min)·amount²/(2·elb_tranche)</code>, exactly half the old
+            formula&rsquo;s quadratic term. See <a href="/redemption">/redemption</a>.
           </Q>
           <Q>
             <b>Minting the FFC-sourced redemption fee&rsquo;s FYC at conservative (not optimistic) price is
@@ -249,9 +260,13 @@ export default function OpenQuestionsPage() {
             event (originate, repay, flag-default) rolls the checkpoint up to now AT THE OLD RATE first, then
             changes the rate — so a loan contributes nothing to anything banked before it existed, and a
             just-collected payment is subtracted back out so it can never double-count on a later rollup. Verified
-            numerically (not just argued) in <code>verify.ts</code>: a two-loan, staggered-origination scenario
-            crossing a repayment boundary, cross-checked against an independently-computed ground truth at every
-            step — see task 35 in this design tool&rsquo;s own working notes.
+            numerically (not just argued): a two-loan, staggered-origination scenario crossing a repayment
+            boundary, cross-checked against an independently-computed ground truth at every step — see task 35
+            in this design tool&rsquo;s own working notes. <b>Not yet captured as an automated regression in{' '}
+            <code>lib/verify.ts</code></b> — that file (added after an external review flagged this exact page
+            claiming it existed when it didn&rsquo;t, see CODEBASE_REVIEW_REPORT.md §3.10) currently covers the
+            severity-gate, cap-exploit, optimistic-price, and instant-fee findings from that review; this
+            accrual scenario is a good candidate for a follow-up addition.
             <br />
             <br />
             <code>/simulator</code>, by contrast, doesn&rsquo;t need this mechanism at all — not because it solved
@@ -261,8 +276,9 @@ export default function OpenQuestionsPage() {
             exactly synchronized by construction — there is no sub-period offset to misrepresent. That&rsquo;s a
             genuinely coarser abstraction than the real contract&rsquo;s continuous-time accrual, not a bug: it
             matches the resolution the simulator already commits to everywhere else (see the yield-epoch entry
-            above), and the conservation checks in <code>verify.ts</code> already confirm no value leaks or gets
-            invented at that resolution. A future enhancement — giving the simulator its own per-loan calendar-day
+            above). <code>lib/verify.ts</code> pins conservation for the FFC-redemption fee path specifically
+            (report §2.3/§2.9&rsquo;s bug class); a period-resolution-specific conservation check isn&rsquo;t
+            in it yet. A future enhancement — giving the simulator its own per-loan calendar-day
             origination and running the exact same accumulator functions from <code>lib/model.ts</code> to drive
             optimistic pricing — is possible but was not undertaken here, for the same tractability reason the
             multi-source rewrite above was scope-cut: a disproportionate rebuild of the simulator&rsquo;s time-

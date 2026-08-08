@@ -1,7 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import Link from 'next/link';
+import LineChart from '@/components/LineChart';
 import { PageHeader, Card, Callout, Collapsible } from '@/components/ui';
 import {
   coverageOf,
@@ -12,6 +13,7 @@ import {
   K_BREAKPOINTS,
   SEVERITY_REF,
   COVERAGE_WEIGHT_FLOOR,
+  ALLOCATION_CEILING_FRACTION,
   fmtUSD,
 } from '@/lib/model';
 
@@ -38,6 +40,16 @@ export default function CoverageSeverityKPage() {
   const base = kBase(coveragePct);
   const severityFactor = Math.min(1, severity / SEVERITY_REF);
   const weight = COVERAGE_WEIGHT_FLOOR + (1 - COVERAGE_WEIGHT_FLOOR) * severityFactor;
+
+  // k_base is coverage-only — connect-the-dots straight lines between the
+  // five stored breakpoints, nothing more. No component state as an input,
+  // so this only ever needs to compute once.
+  const kBaseCurvePoints = useMemo(() => {
+    const pts: { x: number; y: number }[] = [];
+    for (let c = 0; c <= 100; c += 1) pts.push({ x: c, y: kBase(c) });
+    return pts;
+  }, []);
+  const kBaseChartMax = Math.max(5, Math.ceil(K_BREAKPOINTS[0].k / 2) * 2);
 
   const total = FYC + FFC;
   const ffcPctOfTotal = (FFC / total) * 100;
@@ -337,6 +349,54 @@ export default function CoverageSeverityKPage() {
           Between any two of those five dots, the dial just draws a straight line — that&rsquo;s the whole
           &ldquo;starting point&rdquo; lookup table. Nothing fancier than connect-the-dots on real data, plus
           two clearly-labeled guesses at the edges.
+        </p>
+
+        <h3 style={{ marginTop: 28 }}>The full k_base curve</h3>
+        <Collapsible label="what does this chart show?">
+          The same connect-the-dots table above, drawn out — coverage on the x-axis, k_base&rsquo;s
+          starting-point multiplier on the y-axis. Steep near 0% coverage, flattening out toward 100%. The{' '}
+          <b>live</b> marker tracks the slider up top.
+        </Collapsible>
+        <div style={{ marginTop: 10 }} />
+        <LineChart
+          xDomain={[0, 100]}
+          yDomain={[0, kBaseChartMax]}
+          xTicks={[0, 20, 41, 80, 100]}
+          yTicks={Array.from({ length: 6 }, (_, i) => Math.round((kBaseChartMax / 5) * i))}
+          formatX={(v) => Math.round(v) + '%'}
+          formatY={(v) => v.toFixed(1) + '×'}
+          xLabel="coverage →"
+          height={300}
+          vLines={[{ x: coveragePct, label: 'live', color: 'var(--text-primary)', dashed: true }]}
+          series={[{ name: 'k_base', color: 'var(--accent)', points: kBaseCurvePoints, width: 2.5 }]}
+        />
+        <p style={{ fontSize: 13.5, color: 'var(--text-muted)', marginTop: 10 }}>
+          Right now, at {coveragePct.toFixed(1)}% coverage, k_base = <b>{base.toFixed(2)}×</b>.
+        </p>
+
+        <h3 style={{ marginTop: 28 }}>Stored k breakpoints (k_base)</h3>
+        <table className="impl">
+          <thead>
+            <tr>
+              <th>Coverage</th>
+              <th>k_base</th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody>
+            {K_BREAKPOINTS.slice()
+              .reverse()
+              .map((b) => (
+                <tr key={b.cov}>
+                  <td>{b.cov}%</td>
+                  <td className="tabular">{b.k.toFixed(2)}×</td>
+                  <td style={{ color: 'var(--text-secondary)', fontSize: 13 }}>{b.note}</td>
+                </tr>
+              ))}
+          </tbody>
+        </table>
+        <p className="section-dek" style={{ fontSize: 12, marginTop: 10 }}>
+          80% allocation ceiling (unchanged, independent of the severity gate): {(ALLOCATION_CEILING_FRACTION * 100).toFixed(0)}% of total pool value.
         </p>
 
         <h3 style={{ marginTop: 28 }}>And the weight (w) scale — how much of that starting point severity lets through</h3>

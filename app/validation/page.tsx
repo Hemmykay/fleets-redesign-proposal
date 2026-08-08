@@ -8,7 +8,10 @@ const F = 400000;
 const Y = 600000;
 
 function buildSeries() {
-  const xs = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.42, 0.44, 0.46, 0.48, 0.5, 0.52, 0.54];
+  // Dense sampling near 70% — where the new (50% severity) gate now sits,
+  // up from 52% under the old 20% gate. Extended from the old 0-54% range
+  // so the gate marker below isn't clipped off the visible chart.
+  const xs = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.68, 0.7, 0.72, 0.75, 0.78, 0.8];
   return xs.map((x) => {
     const reserveNet = (1 - x) * 29750;
     const loanNet = x * 127500;
@@ -46,10 +49,10 @@ export default function ValidationPage() {
           </span>
         </div>
         <LineChart
-          xDomain={[0, 54]}
-          yDomain={[0, 12]}
-          xTicks={[0, 10, 20, 30, 40, 50]}
-          yTicks={[0, 2, 4, 6, 8, 10, 12]}
+          xDomain={[0, 80]}
+          yDomain={[0, 16]}
+          xTicks={[0, 10, 20, 30, 40, 50, 60, 70, 80]}
+          yTicks={[0, 2, 4, 6, 8, 10, 12, 14, 16]}
           formatX={(v) => Math.round(v) + '%'}
           formatY={(v) => v.toFixed(1) + '%'}
           xLabel="loan book as % of pool value (deployment)"
@@ -57,7 +60,7 @@ export default function ValidationPage() {
           vLines={[
             { x: 40, color: 'var(--text-muted)' },
             { x: 50, label: 'old gate (80% cov.)', color: 'var(--text-muted)' },
-            { x: newGateX, label: `new gate — severity 20% (${newGateX.toFixed(0)}%)`, color: 'var(--warning)' },
+            { x: newGateX, label: `new gate — severity 50% (${newGateX.toFixed(0)}%)`, color: 'var(--warning)' },
           ]}
           series={[
             { name: 'FYC', color: 'var(--fyc)', points: points.map((p) => ({ x: p.x, y: p.fyc })) },
@@ -67,8 +70,8 @@ export default function ValidationPage() {
         <p className="section-dek" style={{ fontSize: 12.5, marginTop: 10 }}>
           At the new gate ({newGateX.toFixed(0)}% deployment): FYC <b style={{ color: 'var(--fyc)' }}>{gatePt.fyc.toFixed(2)}%</b>,
           FFC <b style={{ color: 'var(--ffc)' }}>{gatePt.ffc.toFixed(2)}%</b>. Notice the old gate (50%) sits comfortably
-          inside the new one (52%) — this pool&rsquo;s FYC is large enough that the severity-based gate is strictly more
-          permissive here.
+          inside the new one ({newGateX.toFixed(0)}%) — this pool&rsquo;s FYC is large enough that the severity-based gate is
+          strictly more permissive here.
         </p>
       </Card>
 

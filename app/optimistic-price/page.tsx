@@ -10,6 +10,8 @@ import {
   addLoanToAccrual,
   rollupLoanAccrual,
   blendedApy,
+  totalReserveCapital,
+  totalReserveGrossYieldThisPeriod,
   capFycLoanShare,
   splitBaseYieldTokenYield,
   NET_YIELD_FRACTION,
@@ -135,16 +137,21 @@ export default function OptimisticPricePage() {
 
   // ---------------------------------------------------------------------
   // Reserve/yield-token estimate — blended across every registered source.
+  // totalSourceCapital / totalReserveGrossThisPeriod now come from
+  // lib/model.ts (totalReserveCapital / totalReserveGrossYieldThisPeriod) —
+  // the shared TS mirror of the round-6 pricing.rs "pass all accounts" fix,
+  // rather than duplicated inline here. See those functions' own doc
+  // comments for why realized_losses double-counting (the OTHER round-6 fix,
+  // pricing.rs Decision 1) has no TS-side equivalent to begin with.
   // ---------------------------------------------------------------------
-  const totalSourceCapital = sources.reduce((s, x) => s + x.capitalUsd, 0);
-  const blendedSourceApy = blendedApy(
-    sources.map((s) => ({ id: s.id, capitalUsd: s.capitalUsd, apy: s.apyPct / 100, enabled: true })),
-  );
+  const sourcesWithApy = sources.map((s) => ({ id: s.id, capitalUsd: s.capitalUsd, apy: s.apyPct / 100, enabled: true }));
+  const totalSourceCapital = totalReserveCapital(sourcesWithApy);
+  const blendedSourceApy = blendedApy(sourcesWithApy);
   const perSourcePeriodYield = sources.map((s) => ({
     ...s,
     grossThisPeriod: (s.capitalUsd * (s.apyPct / 100)) / PERIODS_PER_YEAR,
   }));
-  const totalReserveGrossThisPeriod = perSourcePeriodYield.reduce((sum, s) => sum + s.grossThisPeriod, 0);
+  const totalReserveGrossThisPeriod = totalReserveGrossYieldThisPeriod(sourcesWithApy);
 
   // ---------------------------------------------------------------------
   // Putting it together — the exact pipeline compute_optimistic_price runs:

@@ -55,16 +55,16 @@ export default function HomePage() {
           single
           newValue={
             <>
-              <span style={{ color: 'var(--fyc)' }}>3.78%</span>{' '}
-              <span className="arrow">/</span> <span style={{ color: 'var(--ffc)' }}>6.03%</span>
+              <span style={{ color: 'var(--fyc)' }}>4.25%</span>{' '}
+              <span className="arrow">/</span> <span style={{ color: 'var(--ffc)' }}>7.51%</span>
             </>
           }
-          note="at the new severity gate (52% deployment) — k ≈ 1.86×, severity-scaled"
+          note="at the new severity gate (70% deployment) — k ≈ 1.90×, severity-scaled"
         />
         <Kpi
           label="Origination gate"
           oldValue="80% coverage"
-          newValue="20% severity"
+          newValue="50% severity"
           note="decouples origination capacity from FFC's size alone"
         />
       </div>

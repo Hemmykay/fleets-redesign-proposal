@@ -38,7 +38,7 @@ severity        = max(0, outstanding_principal − effective_ffc) / fyc.v_tranch
 
 // new — premium multiplier, replaces fyc_target/residual AND the §5.1 parity anchor
 k_base          = interpolate(coverage, k_breakpoints)          // coverage sets the base curve
-severity_factor = min(1, severity / SEVERITY_REF)                 // severity scales it — SEVERITY_REF = 8%, decoupled from the 20% gate
+severity_factor = min(1, severity / SEVERITY_REF)                 // severity scales it — SEVERITY_REF = 8%, decoupled from the 50% gate
 weight          = COVERAGE_WEIGHT_FLOOR + (1 − COVERAGE_WEIGHT_FLOOR) × severity_factor  // coverage always keeps ≥ half its say
 k               = K_MIN + (k_base − K_MIN) × weight                // K_MIN = 1.25, COVERAGE_WEIGHT_FLOOR = 0.50, k > 1 always
 ffc_share_pct   = (k × ffc.v_tranche) / (fyc.v_tranche + k × ffc.v_tranche)
@@ -49,7 +49,7 @@ ffc_share       = net_yield × ffc_share_pct
 fyc_share       = net_yield − ffc_share
 
 // two new gates, both keyed on severity — helpers/coverage.rs
-assert_origination_allowed():  require(projected_severity ≤ 20%)   // replaces the flat 80% coverage floor
+assert_origination_allowed():  require(projected_severity ≤ 50%)   // replaces the flat 80% coverage floor
 assert_mint_allowed() (new):   require(severity > 2%)              // blocks new FFC deposits once protection is already more than sufficient
 
 // k_breakpoints (k_base) — real observed Junior/Senior spreads on a comparable live tranche market, captured during this design session

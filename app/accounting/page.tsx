@@ -65,11 +65,12 @@ export default function AccountingPage() {
               cash sitting anywhere).
             </code>{' '}
             Deliberately no <code>− realized_losses</code> term here — that already double-subtracts a default
-            in the real contract&rsquo;s <code>compute_v_pool</code>: <code>approve_default.rs</code> reduces{' '}
-            <code>outstanding_principal</code> by the defaulted loan&rsquo;s balance <em>and</em> separately grows{' '}
+            in the real contract&rsquo;s <code>compute_v_pool</code>: the old <code>approve_default.rs</code> reduced{' '}
+            <code>outstanding_principal</code> by the defaulted loan&rsquo;s balance <em>and</em> separately grew{' '}
             <code>realized_losses</code> by the same loss, so subtracting it again on top of the already-shrunk{' '}
-            <code>outstanding_principal</code> counts that loss twice. See <code>/open-questions</code> — flagged
-            there, not fixed in this round. Since the full payment lands in the pool as reserve either way,
+            <code>outstanding_principal</code> counted that loss twice. Fixed round 6 — see{' '}
+            <code>/open-questions</code> and <code>helpers/pricing.rs</code> on <code>/code-diff</code>. Since the
+            full payment lands in the pool as reserve either way,
             switching which schedule <code>outstanding_principal</code> follows doesn&rsquo;t change how much
             money is ever actually in the pool — only how the books narrate getting there.
           </Callout>

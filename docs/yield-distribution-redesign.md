@@ -1,5 +1,28 @@
 # FYC/FFC Yield Distribution Redesign — Proposal
 
+> ## ⚠️ SUPERSEDED — historical record only, do not implement from this document
+>
+> This is the **original** proposal, written before the design introduced **severity** as a
+> concept at all. Everything below describes a coverage-only curve that keeps the old flat
+> **80% coverage gate** (§2, §4) — that decision has since been **reversed**. The current design
+> replaces the 80%-coverage gate with a **severity-based gate** (`assert_origination_allowed`:
+> blocks origination when projected severity exceeds `SEVERITY_GATE_MAX`, currently **50%**), adds
+> a second new gate (`assert_mint_allowed`, blocks FFC minting below `SEVERITY_MINT_FLOOR`), and
+> the coverage→premium curve itself is scaled by severity, not read directly as the FFC share.
+>
+> **If you are implementing this redesign, do not use this document as the spec.** The
+> current, authoritative source is generated fresh from the design tool's own data and cannot
+> drift from what the tool shows: use **`/llm-handoff`** in the design tool (or
+> `app/code-diff/files-data.ts` for code + `lib/model.ts`/`lib/simulate.ts` for the reference
+> math directly). This document is kept only as a record of the design conversation that led
+> here — see `/changes` in the design tool for what changed and why, round by round, since this
+> was written.
+>
+> Sections directly contradicted by the current design: **§2** (the 80% gate "is not being
+> removed" — it was), **§4** (the reasoning for keeping the flat 80% gate — superseded by the
+> severity gate), **§5** (coverage-only curve, no severity scaling), **§6.3** (worked numbers
+> computed at 15%/8% loan APR against the old 80% gate, not the current 50% severity gate).
+
 Status: **design proposal, not yet implemented.** Nothing in this document has been written into the program. It's a record of the design conversation and the decisions reached, intended as the spec to implement against.
 
 ## 1. Motivation
@@ -21,7 +44,7 @@ The redesign replaces the fixed-target/residual split with a **coverage-based cu
 
 ## 2. What stays exactly as-is
 
-- **`assert_origination_allowed`** ([helpers/coverage.rs](../src/helpers/coverage.rs)) — the hard gate blocking new loan origination when `effective_ffc / outstanding_principal < 80%` (`FFC_COVERAGE_NUMERATOR`/`FFC_COVERAGE_DENOMINATOR`). **This is not being removed.** It was considered and explicitly rejected — see §4.
+- **`assert_origination_allowed`** ([helpers/coverage.rs](../src/helpers/coverage.rs)) — the hard gate blocking new loan origination when `effective_ffc / outstanding_principal < 80%` (`FFC_COVERAGE_NUMERATOR`/`FFC_COVERAGE_DENOMINATOR`). **This is not being removed.** It was considered and explicitly rejected — see §4. **[SUPERSEDED — see banner at top: this gate WAS later replaced, by a severity-based one, not removed outright. Do not implement the flat 80% gate from this section.]**
 - **`split_base_yield_token_yield`** ([helpers/waterfall.rs](../src/helpers/waterfall.rs)) — the USDY/reserve-appreciation yield split stays flat pro-rata by tranche size. The curve described here applies **only** to loan interest, not to this yield source. (A pool-share-based curve for this stream was discussed and explicitly deferred — see §7.)
 - **`mint_fee_value_into_fyc`** ([helpers/fees.rs](../src/helpers/fees.rs)) and the 85/15 net/fee split (`split_gross_yield`) — unchanged. The 15% fee still mints new FYC tokens split 2:1 protocol:insurance, on both yield streams, exactly as today.
 - **`apply_default_waterfall`** ([helpers/waterfall.rs](../src/helpers/waterfall.rs)) — the loss side (FFC absorbs losses first, FYC only after FFC is exhausted) is unchanged and was confirmed to already match Exponent's own loss-waterfall design.
@@ -64,6 +87,8 @@ This was explicitly proposed and rejected during design. The reasoning:
 - **Our risk profile is worse for relying on incentives alone.** Exponent's curve pulls capital toward an already-liquid, freely-tradeable yield asset. Ours pulls capital toward the promise that new FFC minters will show up to backstop a book of real-world loan receivables. That's adverse selection territory — a thin, deteriorating coverage ratio is exactly the condition under which cautious capital is least likely to show up despite a high advertised APY. A hard gate bounds the worst case (`originate_loan` simply stops); an incentive curve alone does not.
 
 **Conclusion: the curve is the soft pull toward healthy coverage; `assert_origination_allowed` remains the hard stop if the pull isn't enough or isn't fast enough.** They are complementary, not substitutes.
+
+**[SUPERSEDED — see banner at top.]** The conclusion that a hard gate should stay held, but the gate itself later changed from flat-coverage to severity-based (`assert_origination_allowed` now blocks on projected *severity*, not coverage, against `SEVERITY_GATE_MAX`). The adverse-selection argument above for keeping *a* hard gate at all is still the current reasoning; the specific 80%-coverage mechanics described in this section are not.
 
 ## 5. The new curve
 

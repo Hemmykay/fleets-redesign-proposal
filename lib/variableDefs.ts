@@ -96,7 +96,7 @@ export const VARIABLE_DEFS: Record<string, VariableDef> = {
   },
   SEVERITY_GATE_MAX: {
     symbol: 'SEVERITY_GATE_MAX',
-    def: 'Loan origination is blocked once the projected severity from adding a new loan would exceed this threshold (20% by default) — replaces the old flat 80%-coverage floor.',
+    def: 'Loan origination is blocked once the projected severity from adding a new loan would exceed this threshold (50% by default) — replaces the old flat 80%-coverage floor.',
     glossaryTerm: 'SEVERITY_GATE_MAX — origination gate',
   },
   SEVERITY_MINT_FLOOR: {

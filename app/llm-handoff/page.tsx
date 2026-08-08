@@ -51,7 +51,7 @@ reaches 100% once severity hits 8% (\`SEVERITY_REF\`). \`k\` is floored at 1.25x
 can never equal FYC's, even at zero severity — FFC's own capital is still first-loss regardless.
 
 Two new gates, both keyed on severity (replacing the old flat 80%-coverage floor): origination is
-blocked above 20% projected severity (\`SEVERITY_GATE_MAX\`); FFC minting is blocked below 2% severity
+blocked above 50% projected severity (\`SEVERITY_GATE_MAX\`); FFC minting is blocked below 2% severity
 (\`SEVERITY_MINT_FLOOR\`) — protection is already more than sufficient, more FFC would only dilute
 existing holders.
 
@@ -67,10 +67,12 @@ None of this exists in the live contract; it's a from-scratch addition.
 
 - **Instant vs. scheduled redemption.** Instant (accelerated) redemption pays out immediately from a
   tranche's own ELB (Excess Liquidity Balance — idle reserve, net of outstanding loans and earmarked
-  capital) share, at a liquidity-scaled fee: \`fee_bps = fee_min + (amount/elb_tranche) × (fee_max −
-  fee_min)\`. FYC's band (10-50bps) sits below FFC's (50-100bps) — junior liquidity is scarcer and
-  riskier to hand out on demand. Scheduled redemption is the existing 30d(FYC)/90d(FFC) queue, no fee,
-  priced conservative when it matures.
+  capital) share, at a liquidity-scaled fee — the closed-form integral of the marginal rate over the
+  amount redeemed: \`fee = fee_min·amount + (fee_max−fee_min)·amount²/(2·elb_tranche)\` (see Round 4;
+  an earlier endpoint-rate version of this formula was split-gameable and has been replaced). FYC's band
+  (10-50bps) sits below FFC's (50-100bps) — junior liquidity is scarcer and riskier to hand out on
+  demand. Scheduled redemption is the existing 30d(FYC)/90d(FFC) queue, no fee, priced conservative when
+  it matures.
 - **jr_to_sr / sr_to_jr** — the tranche-conversion primitive. Burns one tranche's tokens at ITS
   conservative price, mints the other's at ITS conservative price — V_pool is unchanged by construction.
   Used directly by the FFC-side redemption fee (fee-portion FFC burned, equivalent value minted as FYC
@@ -142,14 +144,253 @@ are still a fair pro-rata split; (2) the cap's accuracy depends on \`run_yield_e
 regularly to keep \`last_observed_base_apy_bps\` fresh — an operational/liveness risk, not an exploit,
 since only an admin/keeper controls that cadence.
 
+## Round 4 — external security review: parameter decision, real value-destruction bugs fixed
+
+**Decision: \`SEVERITY_GATE_MAX\` set to 50%**, not the 20% used everywhere before this round — chosen
+for capital efficiency (a larger gate supports more loan book per dollar of FYC). Both
+\`lib/model.ts\` and the Rust proposal's \`constants.rs\` are updated together; nothing else about the
+gate's mechanics changed.
+
+**Fixed: severity gate failed OPEN, not closed, when FYC was zero.** \`severityOf\`/\`severity_bps\`
+returned severity 0 (reads as "fully safe") whenever \`FYC == 0\`, which let
+\`assert_origination_allowed\` pass unconditionally for a wiped or uninitialized senior tranche — the
+exact opposite of fail-closed. Fixed everywhere severity is computed (\`lib/model.ts\`,
+\`helpers/coverage.rs\`, \`helpers/tranche_convert.rs\`, \`helpers/waterfall.rs\`): if outstanding is
+already fully covered by FFC alone, severity is genuinely 0; otherwise there's FYC-side exposure with
+no FYC to absorb it, so severity now returns the maximum representable value, guaranteed to trip every
+gate that reads it.
+
+**Fixed: FFC accelerated-redeem fee accounting was double-subtracting real value.** The proposed
+\`accelerated_redeem.rs\` removed a redemption's full \`gross_usd\` from \`ffc.v_tranche\` up front, then
+called \`jr_to_sr\` for the fee portion — which removed that same fee value from \`ffc.v_tranche\` AGAIN
+(and over-reduced \`ffc.total_supply\` to match), while only crediting FYC once. Net effect: fee value
+was destroyed from NAV on every FFC-side accelerated redemption with a nonzero fee. Fixed by removing
+only the investor's net payout up front and letting \`jr_to_sr\` handle the fee's single conversion —
+see \`helpers/tranche_convert.rs\` and \`instructions/accelerated_redeem.rs\`.
+
+**Fixed: \`jr_to_sr\`/\`sr_to_jr\` mutated state before validating it.** Both functions wrote to
+\`fyc\`/\`ffc\` FIRST and checked severity/mint-floor validity AFTER — since both are \`&mut\` references,
+an early \`Err\` return did NOT undo those writes. Combined with the bug above, a rejected fee
+conversion inside \`accelerated_redeem.rs\` (which doesn't propagate \`jr_to_sr\`'s error) left both
+tranches in a half-applied state: value moved, \`total_supply\` inflated, but no tokens actually minted
+to match. Fixed by validating every check (severity gate, mint floor, and the new ELB-vs-pending check
+below) against local copies first, only writing \`fyc\`/\`ffc\` once every check has passed. A rejected
+fee conversion's value is now parked in the new \`TrancheState.suspense_fee_value\` field instead of
+silently vanishing — a permissionless sweep instruction to retry it is flagged as follow-up work, not
+implemented in this excerpt.
+
+**Fixed: \`jr_to_sr\`/\`sr_to_jr\` didn't re-check pending redemptions after converting.** A conversion
+instantly reweights each tranche's share of ELB and could pass its own severity/mint-floor check while
+stranding an already-queued FYC or FFC redeemer behind insufficient post-conversion liquidity. Both now
+require \`elb_fyc >= pending_fyc_redemptions\` and \`elb_ffc >= pending_ffc_redemptions\` after the
+conversion, alongside the existing checks.
+
+**Fixed: the premium curve used raw FFC while the origination gate used \`effective_ffc\`.** The gates
+already netted out \`pending_ffc_redemptions\` before this round; \`distribute_loan_interest\`
+(\`helpers/waterfall.rs\`) and the simulator's equivalent (\`lib/simulate.ts\`) did not — so a large
+queued FFC exit made the gate correctly see thinner protection while the curve kept paying FFC as if
+the full buffer were still there. Both now read \`effective_ffc\` for the risk inputs that set \`k\`; the
+actual revenue-split weighting still uses the real \`ffc.v_tranche\`, since that's the capital actually
+earning today's interest.
+
+**Fixed: the instant-redemption fee formula was split-gameable.** The endpoint-rate formula
+(\`fee_bps = fee_min + (amount/elb_tranche) × (fee_max−fee_min)\`, applied flat to the whole amount) let
+someone reduce their average fee by splitting one redemption into several smaller ones against the
+same \`elb_tranche\` (probe: one \$50K redeem at \$100K ELB paid \$150; two \$25K redeems at the same ELB
+paid \$100 total). Replaced with the closed-form integral of the same marginal rate — see Key formulas
+below — in both \`lib/model.ts\` and \`helpers/liquidity.rs\`.
+
+**Fixed: the insurance floor checked the wrong wallet.** \`assert_origination_allowed\`'s insurance-floor
+check read \`ffc.insurance_token_balance\`, but the new three-tier default waterfall
+(\`helpers/waterfall.rs\`) burns FYC held in the insurance wallet, not FFC. The floor now reads
+\`fyc.insurance_token_balance\`, matching what the waterfall actually burns.
+
+**Compile-fix:** an extra closing brace in the proposed \`helpers/waterfall.rs\` text, right after the
+new \`apply_default_waterfall\`, would have ended the module early and left every function after it
+syntactically invalid. Removed.
+
+**Not fixed in this round, flagged as pre-existing/out of scope (fixed round 6 — see below):**
+\`compute_v_pool\` double-counted a default (\`approve_default.rs\` both shrinks \`outstanding_principal\`
+and grows \`realized_losses\`, and \`compute_v_pool\` subtracted both) — pre-existing in the real contract, not
+introduced by this redesign. Timelocks on admin parameters and permissionless
+keepers for liveness-critical instructions (\`run_yield_epoch\`, \`flag_pending_default\`,
+\`sweep_expired_earmark\`) remain unimplemented design suggestions, not code to hand off. A near-zero FFC
+passing the severity gate (e.g. \$1k FFC "protecting" a large loan book) was reviewed and is an
+INTENTIONAL design decision, not a bug — severity is the sole hard gate; the coverage-driven premium
+curve (verified: k ≈ 12× at ~0.2% coverage) is the deliberate self-correcting incentive for more FFC
+capital to arrive, not something a floor should block.
+
+## Round 5 — loan lifecycle: grace, cure & default
+
+Built from a live design discussion, not a security review — see \`/loan-lifecycle\` for the full
+writeup with worked examples. Replaces the old admin-flagged \`DELINQUENT\`/\`PENDING_DEFAULT\` staging
+with something entirely time-derived: **GRACE** starts automatically the instant a payment is missed
+(no bump, still counted toward optimistic pricing), **CURE** starts automatically 15 days later (APR
+bumped 1.25x, excluded from optimistic pricing), and **DEFAULTED** fires automatically 15 days after
+that — 30 days total, deliberately equal to one payment period, so a loan is never more than one
+payment behind when it defaults. None of these transitions need a stored status change except the
+final one; \`repay_loan.rs\` and the new \`finalize_default.rs\` both compute "what stage would this
+loan be in right now" fresh, off \`Clock\` vs \`LoanAccount.next_payment_due_ts()\`.
+
+The CURE charge is true declining-balance interest at the bumped rate minus the same at the loan's
+real rate, for one period, off the actual outstanding balance — pure interest, added on top of
+\`levelized_interest\` without ever touching \`principal_portion\`, so a late payment never distorts the
+payoff schedule. At default, \`owed_at_default = current_balance + levelized_interest + cure_fee\` is
+computed once and never touched again — the accrued-but-uncollected interest for the loan's final
+unpaid period is folded into what's owed rather than written off.
+
+A \`DEFAULTED\` loan then sits indefinitely until one of three first-come-first-served paths resolves
+it (a \`RESOLVED\` status enforces mutual exclusion — whichever lands first wins): **resell** (admin
+supplies actual sale proceeds; loss = \`max(0, owed_at_default − recovery)\`, surplus back to the
+borrower if recovery exceeds what was owed); **relist** (the same collateral becomes a new loan for a
+new or the same borrower — no swap/disbursement leg, since there's no fresh cash to hand anyone; the
+new principal directly replaces \`owed_at_default\`, only a shortfall is a real loss); or **IOU — NOT
+SUPPORTED IN V1** (no instruction exists; a revenue-share instrument with no fixed schedule, scoped only
+to already-defaulted loans if it's ever built, deferred as its own separate design conversation). A
+DEFAULTED loan resolves via resell or relist only until that changes. Both resell and relist
+route any real loss through the same insurance-first three-tier waterfall (FFC → insurance-held FYC →
+general FYC) already fixed elsewhere in this redesign — see \`helpers/waterfall.rs\`.
+
+\`approve_default.rs\` and \`record_recovery.rs\` are deprecated (their \`ix_tag\` discriminants, 7 and 8,
+stay registered but now dispatch to stubs that always error) — superseded by \`resell_defaulted_loan.rs\`,
+which measures loss against actual recovery instead of an arbitrary admin-typed \`confirmed_gross_loss\`
+with zero on-chain tether to reality. \`flag_pending_default.rs\` is renamed to \`finalize_default.rs\`
+in place (\`ix_tag\` discriminant 6 unchanged) and made fully permissionless — every check is a
+deterministic \`Clock\` read, so there's no privileged judgment left to gate behind an admin.
+
+**Explicitly flagged assumptions, not confirmed decisions:** relist closes the old loan and originates
+the new one atomically, in one instruction (the alternative — two separate transactions — was
+discussed and not settled); relist still re-clears \`assert_origination_allowed\`'s severity gate even
+though no new external risk capital is technically being added; the 1% origination fee charged on
+relist (\`ORIGINATION_FEE_BPS\`) is this protocol's first real on-chain implementation of a fee that
+previously only existed in \`lib/model.ts\` as \`ORIGINATION_FEE_FRACTION\`, worth explicit sign-off
+before treating it as settled for normal originations too.
+
+## Round 6 — multi-source pricing + the default double-count, fixed together
+
+Two bugs in the real, currently-deployed \`helpers/pricing.rs\` — confirmed by pulling and quoting the
+real file (it had never been added to this handoff before; every prior reference to \`compute_v_pool\`
+across this design was a call site with no defined body here) — decided and fixed in the same pass,
+since both live in the same two functions.
+
+**Decision 1 — drop the double-counted \`− realized_losses\` term.** \`approve_default.rs\` already
+shrinks \`outstanding_principal\` by a defaulted loan's balance AND separately grows
+\`realized_losses\` by the same loss; the old \`compute_v_pool\`/\`compute_v_pool_true\` subtracted both,
+permanently understating every tranche price after any default that wasn't fully recovered. Fixed by
+dropping the \`realized_losses\` READ from both pricing functions. The field itself is unchanged — still
+written by \`resell_defaulted_loan.rs\`/\`relist_defaulted_loan.rs\` — now kept purely as an
+analytics-only lifetime-losses counter.
+
+**Decision 2 — "pass all accounts."** \`compute_v_pool\` only ever summed the primary reserve's
+\`c_tokens\`; every additional registered \`YieldSourceState\`'s real capital was invisible to TVL, the
+loan-allocation cap, and the optimistic-price split denominator. Chosen fix, over a running-total
+checkpoint alternative: both \`compute_v_pool\` and \`compute_v_pool_true\` now take an explicit
+\`sources\`/\`source_prices\` slice and sum across all of them. New \`load_other_sources\` (in
+\`helpers/allocation.rs\`) reads that slice off a trailing \`(yield_source, oracle)\` account pair per
+additional source, appended to \`deposit.rs\`, \`deposit_yield_token.rs\`, and \`run_yield_epoch.rs\`
+(which also gains an explicit \`mode\` byte in its instruction data, since accounts-array length alone no
+longer disambiguates its two branches once a variable-length tail is allowed).
+
+**The alternative that was passed over, written up on request, not wired in:** a pool-wide
+\`reserve_value_checkpoint\` running total, refreshed incrementally at whichever single source changed —
+the same shape as the \`loan_accrual_rate\`/checkpoint/updated_ts pattern already shipped for loan
+interest. Trades "every call pays for extra accounts + oracle reads" for "every future capital-moving
+call site must remember to bump the checkpoint or silently reintroduce drift, with no compiler error to
+catch the omission." See \`helpers/reserve_checkpoint_sketch.rs\` on \`/code-diff\` — deliberately excluded
+from \`helpers/mod.rs\`, a design memo with real signatures attached, not shipped code.
+
+TS mirror: \`totalReserveCapital\`/\`totalReserveGrossYieldThisPeriod\` in \`lib/model.ts\`, now the shared
+implementation behind \`/optimistic-price\` (previously duplicated inline on that page); the
+\`realized_losses\` double-count has no TS-side equivalent to fix, since the simulator already reduces
+\`fyc\`/\`ffc\`/the loan book directly at default time with no second ledger to double-subtract. Pinned by
+two new \`lib/verify.ts\` checks (multi-source sum correctness + order-independence; default loss applied
+exactly once).
+
+## Round 7 — closing the two P0s an end-to-end review found
+
+A new \`END_TO_END_PROTOCOL_SIMULATION.md\` walked every lifecycle path (genesis, deposit, epoch,
+origination, repayment, mid-period mint, redemption, conversion, default, multi-source portfolio) and
+scored each WORKS / FRAGILE / BREAKS / GAP / DECISION. Two findings were verified against the actual code
+(not just the spec) and fixed; a third was checked and confirmed already fine; a fourth was checked and
+confirmed not actually live in \`files-data.ts\`.
+
+**Fixed: optimistic yield_estimate was still single-source.** Round 6 fixed \`compute_v_pool\`'s TVL sum
+(the split *denominator*) to cover every registered source, but \`compute_optimistic_price\`'s
+yield-delta term (the *numerator*) stayed scoped to whichever one source a given deposit targeted —
+depositors were under-credited for every OTHER source's real unrealized appreciation. Fixed by summing
+every source's own delta: primary's reads straight off \`PoolState\` (\`c_tokens\` vs
+\`last_base_yield_token_price\`/the live price), every other source's off its own entry in the
+\`other_sources\`/\`other_source_prices\` slice already threaded through for round 6. The now-redundant
+\`source_c_tokens\`/\`source_last_price\`/\`source_price_now\` params are gone from the signature entirely —
+both call sites (\`deposit.rs\`, \`deposit_yield_token.rs\`) updated to match.
+
+**Fixed: resell never actually moved the recovered cash into the pool.** \`resell_defaulted_loan.rs\`
+computed surplus-out and deficit-waterfall correctly, but \`recovery_amount\` itself was only ever a
+number in instruction data the admin asserted — no transfer ever moved it into \`deposit_vault\`.
+\`outstanding_principal\` dropped by the full loan balance regardless, so the books marked the debt
+collected without any cash landing — a real value-leakage path, not just an "under-specified" gap as
+first characterized. Fixed by adding \`admin_proceeds_acc\` (holding the actual, already-converted sale
+proceeds) and an unconditional \`Transfer\` of the full \`recovery_amount\` into \`deposit_vault\`, before the
+existing surplus/deficit branch.
+
+**Checked, no fix needed:** \`relist_defaulted_loan.rs\` already does real transfers for \`equity_amount\`
+and the origination fee; \`new_principal\` is bookkeeping that replaces \`owed_at_default\`, not cash needing
+to move immediately — same as any origination's principal. **Checked, not a live defect:** the "old
+\`compute_v_pool\` mixed with new writers" deploy-mixing risk — every \`proposed\` call site in
+\`files-data.ts\` already uses the round-6 signature; this stays a real rollout-sequencing caution for
+whoever ships the handoff, not something more code here can fix.
+
+## Round 8 — findings-verification response + greenfield cleanup
+
+A follow-up review (\`FINDINGS_VERIFICATION_2026-08-07.md\`) checked round 7's own "both P0s fixed" claim
+against the actual code before accepting it, confirmed the two P0s genuinely were fixed, and then pushed
+back on the broader claim of "addressed all findings" — several P1/P2/P3 items from the earlier reviews
+were still open. It also surfaced a real constraint worth acting on: **nothing is deployed yet**, so this
+handoff's backward-compatibility scaffolding (deprecation stubs, append-only discriminants, realloc +
+backfill migration prose) was solving a problem that doesn't exist yet.
+
+**Fixed: the P1 "optional multi-source tail."** Omitting the trailing \`(yield_source, oracle)\` account
+pairs used to be a silently *valid* call, just priced against less than the pool's real total. New
+\`helpers/allocation.rs::require_complete_source_list\` rejects (\`IncompleteYieldSourceList\`) any
+\`deposit.rs\` / \`deposit_yield_token.rs\` / \`run_yield_epoch.rs\` call whose final source count falls
+short of \`pool.yield_source_count\`.
+
+**Greenfield cleanup, since first deploy = whatever gets frozen now:** \`approve_default.rs\` /
+\`record_recovery.rs\` and their \`ix_tag\`s (7, 8) are removed outright rather than kept as
+deprecation-stub instructions — \`InstructionDeprecated\` is gone from \`errors.rs\`, and slot 50 is
+reused for \`IncompleteYieldSourceList\`. \`DELINQUENT\` / \`PENDING_DEFAULT\` loan-status values and
+\`LoanAccount.delinquency_start_ts\` are removed rather than kept as inert compatibility fields — both were
+already unused by any new code. \`run_yield_epoch.rs\`'s two branches are now framed as two permanent modes
+(primary vs. source tick), not "backward compatible with the original 5-account form."
+
+**Docs:** \`/open-questions\`' stale bullet describing the pre-round-5 admin-staged
+\`flag_pending_default\`/\`approve_default\` flow is rewritten to describe the actual current gap
+(permissionless \`finalize_default.rs\` still needs *someone* to call it during CURE) instead. IOU is now
+explicitly labeled **"NOT SUPPORTED IN V1"** on \`/loan-lifecycle\` and here, rather than left as an
+implicit "unspecified."
+
+**Left open, correctly** — these are genuine ops/product decisions, not code gaps a Rust instruction
+proposal resolves by itself: cure-accrual-without-a-keeper, earmark concurrency race, convert↔originate
+atomicity, epoch/APY staleness for the FYC cap. \`tsc --noEmit\`, \`eslint\`, and \`npm run verify\` (19/19)
+all pass.
+
 ## Key formulas (reference implementation: lib/model.ts)
 
 \`\`\`txt
-coverage           = min(1, FFC / outstanding)
-severity           = max(0, outstanding − FFC) / FYC
+effective_ffc      = FFC − pending_ffc_redemptions   // nets out FFC already queued to leave — GATES ONLY
+coverage           = min(1, FFC / outstanding)                    // curve/distribution: raw FFC, not effective_ffc
+severity           = max(0, outstanding − FFC) / FYC   // FYC == 0: 0 if outstanding <= FFC, else fails closed (max)
+// origination/mint gates use effective_ffc for THEIR OWN severity/coverage check instead (forward-looking:
+// protects a NEW loan's whole future life against capital scheduled to leave) — distribute_loan_interest
+// deliberately does not, since pending-redemption FFC is still fully at risk until actually paid out.
 k                  = K_MIN + (k_base(coverage) − K_MIN) × weight
 weight             = COVERAGE_WEIGHT_FLOOR + (1 − COVERAGE_WEIGHT_FLOOR) × min(1, severity / SEVERITY_REF)
 ffc_share_of_loan  = (k × FFC) / (FYC + k × FFC)
+
+grace_period_days  = 15   // no APR bump, still counted toward optimistic pricing
+cure_period_days   = 15   // APR bumped 1.25x, excluded from optimistic pricing; +grace = 30 days total
+cure_fee           = period_interest(current_balance, apr × 1.25) − period_interest(current_balance, apr)
+owed_at_default    = current_balance + levelized_interest + cure_fee   // computed once, at finalize_default
 
 reserve_apy         = fyc_reserve_share × PERIODS_PER_YEAR / fyc_apy_base
 loan_apy_headroom   = max(0, MAX_FYC_APY − reserve_apy)
@@ -160,7 +401,7 @@ fyc_apy_base        = min(fycStart, fyc)   // the balance FYC started the period
 optimistic_price   = (v_tranche + loan_estimate + yield_estimate) / total_supply
 conservative_price = v_tranche / total_supply
 
-fee_bps            = fee_min + (amount / elb_tranche) × (fee_max − fee_min)
+fee                = fee_min·amount + (fee_max − fee_min) × amount² / (2 × elb_tranche)   // split-invariant integral, not the old endpoint rate
 blended_apy        = Σ(capital_i × apy_i) / Σ capital_i     (every source with capital > 0)
 \`\`\`
 

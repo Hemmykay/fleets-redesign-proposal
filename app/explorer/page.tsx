@@ -5,7 +5,6 @@ import { useSeverityGate } from '@/components/SeverityGateContext';
 import LineChart from '@/components/LineChart';
 import { PageHeader, Card, Readout, Callout, Pill, Meter, Collapsible } from '@/components/ui';
 import {
-  K_BREAKPOINTS,
   SEVERITY_MINT_FLOOR,
   SEVERITY_REF,
   ALLOCATION_CEILING_FRACTION,
@@ -32,6 +31,7 @@ import {
 const TERM_MONTHS = 36;
 
 export default function ExplorerPage() {
+  const [tab, setTab] = useState<'curve' | 'allocation'>('curve');
   const [fyc, setFyc] = useState(600000);
   const [ffc, setFfc] = useState(400000);
   const [out, setOut] = useState(450000);
@@ -180,6 +180,17 @@ export default function ExplorerPage() {
         }
       />
 
+      <div className="tab-bar">
+        <button className={`tab-btn ${tab === 'curve' ? 'active' : ''}`} onClick={() => setTab('curve')}>
+          Coverage &amp; curve
+        </button>
+        <button className={`tab-btn ${tab === 'allocation' ? 'active' : ''}`} onClick={() => setTab('allocation')}>
+          Max loan allocation
+        </button>
+      </div>
+
+      {tab === 'curve' && (
+      <>
       <Card>
         <div className="grid-2">
           <div>
@@ -422,8 +433,8 @@ export default function ExplorerPage() {
           Reopened and replaced: the old rule blocked new loans whenever coverage dropped below a flat 80%,
           regardless of how large FYC actually was — which meant origination capacity was bottlenecked by
           FFC&rsquo;s size alone, even when FYC could easily absorb the real risk. The new rule blocks a loan
-          only if it would push severity above the gate threshold above ({severityGateMax}%, adjustable — 20%
-          in the original design), measured against FYC&rsquo;s actual size instead of assumed to be 1:1 with
+          only if it would push severity above the gate threshold above ({severityGateMax}%, adjustable — 50%
+          in the current design), measured against FYC&rsquo;s actual size instead of assumed to be 1:1 with
           it. Try it: at $600K/$400K, growing FYC to $2M raises the origination ceiling from{' '}
           {fmtUSD(severityCeilingOutstanding(400000, 600000, gateMax))} to{' '}
           {fmtUSD(severityCeilingOutstanding(400000, 2000000, gateMax))} with FFC untouched.
@@ -436,31 +447,123 @@ export default function ExplorerPage() {
           marginal protection is negligible, which is exactly what a severity floor measures.
         </Collapsible>
       </div>
+      </>
+      )}
+
+      {tab === 'allocation' && (
+        <MaxAllocationTab fyc={fyc} ffc={ffc} gateMax={gateMax} severityGateMax={severityGateMax} />
+      )}
+    </>
+  );
+}
+
+/** Sweeps every possible FYC:FFC split at a fixed total TVL and asks: what's
+ * the largest loan (as % of TVL) the severity gate would ever allow at THIS
+ * split, before the flat 80% allocation ceiling (independent of the split)
+ * takes over as the binding constraint instead? Closed-form, not numerically
+ * searched — see severityCeilingOutstanding/bindingConstraint in lib/model.ts,
+ * the same two functions every other gate check on this page already uses.
+ *
+ * severity ceiling, as a fraction of TVL, at FFC share x = FFC/TVL:
+ *   outstanding/TVL ≤ x + gateMax·(1 − x)  =  gateMax + (1 − gateMax)·x
+ * increasing in x, so more FFC always raises the severity-side ceiling —
+ * until it crosses the flat allocation ceiling, where more FFC stops buying
+ * any additional capacity at all.
+ */
+function MaxAllocationTab({ fyc, ffc, gateMax, severityGateMax }: { fyc: number; ffc: number; gateMax: number; severityGateMax: number }) {
+  const totalTvl = fyc + ffc;
+  const yourFfcSharePct = totalTvl > 0 ? (ffc / totalTvl) * 100 : 0;
+
+  // Where the two lines cross: gateMax + (1-gateMax)*x = ALLOCATION_CEILING_FRACTION.
+  // If the gate is already at or above the allocation ceiling, the flat 80%
+  // line binds everywhere, even at FFC share 0 — crossover collapses to 0%.
+  const crossoverFfcSharePct =
+    gateMax >= ALLOCATION_CEILING_FRACTION
+      ? 0
+      : Math.max(0, Math.min(100, ((ALLOCATION_CEILING_FRACTION - gateMax) / (1 - gateMax)) * 100));
+
+  const points = useMemo(() => {
+    const severityLine: { x: number; y: number }[] = [];
+    const maxLine: { x: number; y: number }[] = [];
+    for (let x = 0; x <= 100; x += 1) {
+      const frac = x / 100;
+      const severityRatioPct = (gateMax + (1 - gateMax) * frac) * 100;
+      severityLine.push({ x, y: Math.min(100, severityRatioPct) });
+      maxLine.push({ x, y: Math.min(severityRatioPct, ALLOCATION_CEILING_FRACTION * 100) });
+    }
+    return { severityLine, maxLine };
+  }, [gateMax]);
+
+  const yourMaxLoanPct = Math.min(
+    gateMax * 100 + (100 - gateMax * 100) * (yourFfcSharePct / 100),
+    ALLOCATION_CEILING_FRACTION * 100,
+  );
+
+  return (
+    <>
+      <Card>
+        <h3 style={{ marginTop: 0 }}>The highest possible loan, as a % of total pool value</h3>
+        <p style={{ fontSize: 14, color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+          Sweeping every possible FYC:FFC split at a fixed total pool value — not just this page&rsquo;s current
+          sliders — answers a different question than the live dashboard on the other tab: not &ldquo;what can{' '}
+          <em>this</em>{' '}
+          pool originate right now,&rdquo; but &ldquo;what&rsquo;s the largest loan book ANY pool,
+          at ANY split, could ever get to.&rdquo; Two independent ceilings apply at every split — whichever is
+          smaller wins:
+        </p>
+        <ul style={{ fontSize: 14, lineHeight: 1.9, paddingLeft: 20 }}>
+          <li>
+            <b>Severity gate</b> — rises with FFC&rsquo;s share of the pool: <code>outstanding/TVL ≤{' '}
+            {severityGateMax}% + {(100 - severityGateMax).toFixed(0)}% × (FFC ÷ TVL)</code>. More FFC always
+            buys more room, on this constraint alone.
+          </li>
+          <li>
+            <b>80% allocation ceiling</b> — flat, {(ALLOCATION_CEILING_FRACTION * 100).toFixed(0)}% of TVL
+            regardless of split. Doesn&rsquo;t care how the pool is divided at all.
+          </li>
+        </ul>
+        <Callout>
+          <strong>The answer: {(ALLOCATION_CEILING_FRACTION * 100).toFixed(0)}%, always</strong> — no split ever
+          lets the pool originate more than the flat allocation ceiling. At the current {severityGateMax}%
+          severity gate, that ceiling is reached once FFC alone is{' '}
+          <b>{crossoverFfcSharePct.toFixed(1)}%</b>{' '}
+          of total pool value — past that point, adding MORE FFC buys
+          zero additional loan capacity, since the allocation ceiling (not severity) is already what&rsquo;s
+          binding.
+        </Callout>
+      </Card>
 
       <Card style={{ marginTop: 16 }}>
-        <h3>Stored k breakpoints (k_base)</h3>
-        <table className="impl">
-          <thead>
-            <tr>
-              <th>Coverage</th>
-              <th>k_base</th>
-              <th>Source</th>
-            </tr>
-          </thead>
-          <tbody>
-            {K_BREAKPOINTS.slice()
-              .reverse()
-              .map((b) => (
-                <tr key={b.cov}>
-                  <td>{b.cov}%</td>
-                  <td className="tabular">{b.k.toFixed(2)}×</td>
-                  <td style={{ color: 'var(--text-secondary)', fontSize: 13 }}>{b.note}</td>
-                </tr>
-              ))}
-          </tbody>
-        </table>
-        <p className="section-dek" style={{ fontSize: 12, marginTop: 10 }}>
-          80% allocation ceiling (unchanged, independent of the severity gate): {(ALLOCATION_CEILING_FRACTION * 100).toFixed(0)}% of total pool value.
+        <h3 style={{ marginTop: 0 }}>Max loan ceiling vs. FFC&rsquo;s share of the pool</h3>
+        <Collapsible label="what does this chart show?">
+          The solid line is the actual binding ceiling at each possible split — the smaller of the two
+          constraints above. The dashed line is the severity gate alone, uncapped, so you can see where it
+          WOULD go if the allocation ceiling weren&rsquo;t there. Where they diverge is the crossover point.
+        </Collapsible>
+        <div style={{ marginTop: 10 }} />
+        <LineChart
+          xDomain={[0, 100]}
+          yDomain={[0, 100]}
+          xTicks={[0, 20, 40, 60, 80, 100]}
+          yTicks={[0, 20, 40, 60, 80, 100]}
+          formatX={(v) => Math.round(v) + '%'}
+          formatY={(v) => Math.round(v) + '%'}
+          xLabel="FFC's share of total pool value →"
+          height={320}
+          vLines={[
+            { x: crossoverFfcSharePct, label: `crossover ${crossoverFfcSharePct.toFixed(0)}%`, color: 'var(--warning)' },
+            { x: yourFfcSharePct, label: 'your pool', color: 'var(--text-primary)', dashed: true },
+          ]}
+          hLines={[{ y: ALLOCATION_CEILING_FRACTION * 100, label: `${(ALLOCATION_CEILING_FRACTION * 100).toFixed(0)}% allocation ceiling`, color: 'var(--text-muted)' }]}
+          series={[
+            { name: 'Max loan (% of TVL)', color: 'var(--accent)', points: points.maxLine, width: 2.5 },
+            { name: 'Severity gate alone (uncapped)', color: 'var(--fyc)', points: points.severityLine, width: 1.5, dashed: true },
+          ]}
+        />
+        <p style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 10 }}>
+          Your pool right now: FFC is <b>{yourFfcSharePct.toFixed(1)}%</b> of total value ({fmtUSD(ffc)} of{' '}
+          {fmtUSD(totalTvl)}), max loan ceiling <b>{yourMaxLoanPct.toFixed(1)}%</b> of TVL — switch to the{' '}
+          <b>Coverage &amp; curve</b> tab to move the sliders and watch this marker move.
         </p>
       </Card>
     </>

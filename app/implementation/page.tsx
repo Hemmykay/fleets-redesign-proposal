@@ -119,7 +119,7 @@ InterpOutOfDomain,          // coverage_bps outside the stored range
 InterpArithmetic,           // overflow during the lerp itself
 
 // helpers/coverage.rs — gates
-SeverityGateExceeded,       // origination blocked, projected severity > 20%
+SeverityGateExceeded,       // origination blocked, projected severity > 50%
 MintFloorNotMet,            // FFC mint blocked, severity <= 2%
 SeverityArithmetic,         // overflow computing (P - FFC) / FYC`} />
         </Card>

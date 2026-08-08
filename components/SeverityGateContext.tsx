@@ -18,7 +18,7 @@ interface SeverityGateContextValue {
 const SeverityGateContext = createContext<SeverityGateContextValue | null>(null);
 
 export function SeverityGateProvider({ children }: { children: ReactNode }) {
-  const [severityGateMax, setSeverityGateMax] = useState(30);
+  const [severityGateMax, setSeverityGateMax] = useState(50);
   return (
     <SeverityGateContext.Provider value={{ severityGateMax, setSeverityGateMax }}>
       {children}

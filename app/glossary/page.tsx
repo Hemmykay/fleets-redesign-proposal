@@ -77,7 +77,8 @@ const capExample = capFycLoanShare({ fyc: FYC, ffc: FFC, outstanding: OUT }, cap
 // Staggered-origination accrual worked example — loan A originates "July 3"
 // (day 0), loan B originates 18 days later, "July 21". Proves the O(1)
 // accumulator matches summing each loan's own elapsed-time-into-its-own-
-// cycle accrual, computed independently — see /latex and verify.ts.
+// cycle accrual, computed independently — see /latex. (Not yet an
+// automated regression in lib/verify.ts — see that file's header.)
 const accrualLoanA = { levelized: levelizedInterest(100000, 0.15, 36), originDay: 0 };
 const accrualLoanB = { levelized: levelizedInterest(60000, 0.18, 24), originDay: 18 };
 const accrualRateA = accrualLoanA.levelized / SECONDS_PER_PERIOD;
@@ -189,8 +190,8 @@ const entries: { group: string; items: Entry[] }[] = [
     items: [
       {
         term: 'SEVERITY_GATE_MAX — origination gate',
-        def: 'Loan origination is blocked once the projected severity from adding a new loan would exceed this threshold (20%). Replaces the old flat 80%-coverage floor. Because it’s keyed on severity rather than coverage, origination capacity scales with FYC’s actual size, not FFC’s alone.',
-        formula: <>{'assert_origination_allowed: require(severity(P + new_loan, FFC, FYC) ≤ 20%)'}</>,
+        def: 'Loan origination is blocked once the projected severity from adding a new loan would exceed this threshold (50%). Replaces the old flat 80%-coverage floor. Because it’s keyed on severity rather than coverage, origination capacity scales with FYC’s actual size, not FFC’s alone.',
+        formula: <>{'assert_origination_allowed: require(severity(P + new_loan, FFC, FYC) ≤ 50%)'}</>,
       },
       {
         term: 'SEVERITY_MINT_FLOOR — minting ceiling',
@@ -227,9 +228,10 @@ const entries: { group: string; items: Entry[] }[] = [
             Loan A ($100K/15%/36 periods, originates day 0) + Loan B ($60K/18%/24 periods, originates day 18):
             querying the accumulator on day 25 gives <b>{fmtUSD2(accrualAtQuery)}</b> accrued — exactly matching{' '}
             <b>{fmtUSD2(accrualGroundTruth)}</b> from independently summing each loan’s own elapsed-time-into-its-own-cycle
-            accrual (25 days of loan A + 7 days of loan B). No value leaked, none invented — see the full multi-step proof
-            (including a repayment crossing a period boundary) in verify.ts, and the interactive version on{' '}
-            <a href="/latex">/latex</a>.
+            accrual (25 days of loan A + 7 days of loan B). No value leaked, none invented — see the interactive
+            version on <a href="/latex">/latex</a> (the full multi-step proof, including a repayment crossing a
+            period boundary, is not yet an automated regression in <code>lib/verify.ts</code> — see that
+            file&rsquo;s header).
           </>
         ),
       },

@@ -543,7 +543,10 @@ export function runSimulation(config: ScenarioConfig): SimResult {
       const conservativePrice = supply > 0 ? value / supply : 1;
       if (a.kind === 'mint') {
         if (a.tranche === 'ffc') {
-          const gate = assertMintAllowed({ fyc, ffc, outstanding });
+          // effective ffc — see capFycLoanShare's call below for why a
+          // queued FFC exit should make this gate see the same thinner
+          // protection assertOriginationAllowed already does.
+          const gate = assertMintAllowed({ fyc, ffc: ffc - pendingAmount('ffc'), outstanding });
           if (!gate.allowed) {
             events.push({
               period,
@@ -663,9 +666,8 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     // Math.min(fycStart, fyc) closes both directions at once: the $ ceiling
     // is always sized against whichever balance — the one FYC started the
     // period with, or the one it ends step 2 with — is SMALLER, so it can
-    // never exceed maxFycApy relative to either. See /optimistic-price and
-    // /security-review for the full writeup and the regression tests this
-    // is pinned against.
+    // never exceed maxFycApy relative to either. See /optimistic-price for
+    // the full writeup and the regression tests this is pinned against.
     const loanDist = capFycLoanShare(
       { fyc, ffc, outstanding },
       loanGrossInterest,
@@ -749,7 +751,14 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     let originationFeeProtocol = 0;
     let originationFeeInsurance = 0;
     for (const o of originationsByPeriod.get(period) ?? []) {
-      const gate = assertOriginationAllowed({ fyc, ffc, outstanding }, o.amount, config.severityGateMax);
+      // effective ffc — a queued FFC exit shouldn't count toward the buffer
+      // this gate is protecting; re-read live per loan, same as the real
+      // pendingAmount closure is documented to do elsewhere in this loop.
+      const gate = assertOriginationAllowed(
+        { fyc, ffc: ffc - pendingAmount('ffc'), outstanding },
+        o.amount,
+        config.severityGateMax,
+      );
       if (gate.allowed) {
         const m = monthlyPayment(o.amount, o.apr, o.termMonths);
         const lev = levelizedInterest(o.amount, o.apr, o.termMonths);
@@ -788,8 +797,12 @@ export function runSimulation(config: ScenarioConfig): SimResult {
     originationFeeProtocolCum += originationFeeProtocol;
     originationFeeInsuranceCum += originationFeeInsurance;
 
-    const coveragePct = coverageOf(outstanding, ffc) * 100;
-    const severity = severityOf(outstanding, ffc, fyc);
+    // effective ffc — matches assertMintAllowed's own input above, so the
+    // mint-blocked indicator below (read directly off this severity value)
+    // agrees with what a same-period mint attempt would actually see.
+    const effectiveFfcNow = ffc - pendingAmount('ffc');
+    const coveragePct = coverageOf(outstanding, effectiveFfcNow) * 100;
+    const severity = severityOf(outstanding, effectiveFfcNow, fyc);
     // NOTE: whether minting is currently blocked is a STATE (read directly
     // off step.severity in the UI, against SEVERITY_MINT_FLOOR), not an
     // EVENT — it used to fire into the log every single period severity sat

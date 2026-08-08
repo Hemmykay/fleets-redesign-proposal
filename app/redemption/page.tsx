@@ -73,7 +73,7 @@ export default function RedemptionPage() {
         </Callout>
         <Card>
           <div className="formula">
-            {`fee_bps = fee_min + (amount / elb_tranche) × (fee_max − fee_min)
+            {`fee = fee_min·amount + (fee_max − fee_min) × amount² / (2 × elb_tranche)
 
 FYC:  fee_min = ${INSTANT_FEE_BPS.fyc[0]} bps (${(INSTANT_FEE_BPS.fyc[0] / 100).toFixed(2)}%)   fee_max = ${INSTANT_FEE_BPS.fyc[1]} bps (${(INSTANT_FEE_BPS.fyc[1] / 100).toFixed(2)}%)
 FFC:  fee_min = ${INSTANT_FEE_BPS.ffc[0]} bps (${(INSTANT_FEE_BPS.ffc[0] / 100).toFixed(2)}%)   fee_max = ${INSTANT_FEE_BPS.ffc[1]} bps (${(INSTANT_FEE_BPS.ffc[1] / 100).toFixed(2)}%)
@@ -85,11 +85,13 @@ amount > elb_tranche  →  instant path unavailable, must use the scheduled queu
           <h3 style={{ marginTop: 0 }}>Worked example</h3>
           <p className="section-dek">
             $100K available liquidity, FYC:FFC pool share 40:60 → ELB<sub>FYC</sub> = {fmtUSD(exElbFyc)}. Someone
-            redeeming {fmtUSD(exRedeem)} FYC — the midpoint of $0&ndash;${fmtUSD(exElbFyc).slice(1)} — lands at
-            the midpoint of the fee band.
+            redeeming {fmtUSD(exRedeem)} FYC — the midpoint of $0&ndash;${fmtUSD(exElbFyc).slice(1)} — pays the
+            AVERAGE rate over that path, not the rate at the midpoint itself: this integral formula is the
+            closed-form integral of the marginal rate from $0 up to the amount redeemed, so it always lands
+            below what the old endpoint-rate formula would have charged for the same amount.
           </p>
           <div className="readout-grid">
-            <Readout label="fee rate" value={`${exFee.feeBps.toFixed(2)} bps`} sub="midpoint of 10–50 bps" color="var(--fyc)" />
+            <Readout label="fee rate" value={`${exFee.feeBps.toFixed(2)} bps`} sub="average over $0–$20K, not the endpoint rate" color="var(--fyc)" />
             <Readout label="fee value" value={fmtUSD(exFee.feeValue)} sub="settled as FYC, 50/50 to protocol/insurance" />
             <Readout label="net payout" value={fmtUSD(exFee.netPayout)} sub={`of ${fmtUSD(exRedeem)} requested`} />
           </div>
@@ -99,15 +101,16 @@ amount > elb_tranche  →  instant path unavailable, must use the scheduled queu
             automatically — there&rsquo;s no separate &ldquo;recalculate&rdquo; step.
           </p>
         </Card>
-        <Callout tone="amber" >
-          <b>Known, deliberately unfixed gaming vector:</b> because ELB is read live, splitting one large
-          redemption into several small ones inside a single transaction (before anything else can move ELB)
-          converges the average rate paid toward fee_min — this endpoint formula is quadratic but not
-          split-invariant. The closed-form fix is charging the integral of the same marginal rate,{' '}
-          <code>fee = fee_min·amount + (fee_max−fee_min)·amount²/(2·elb_tranche)</code> — exactly half this
-          formula&rsquo;s quadratic term — which IS split-invariant. Not adopted here because it changes this
-          worked example&rsquo;s numbers; flagged on <code>/open-questions</code> as the recommended production
-          hardening.
+        <Callout>
+          <b>FIXED (security review):</b> the old endpoint-rate formula — <code>fee_bps = fee_min +
+          (amount/elb_tranche) × (fee_max−fee_min)</code>, applied flat to the whole amount — was split-gameable:
+          because ELB is read live, splitting one large redemption into several small ones against the same
+          elb_tranche converged the average rate paid toward fee_min (a $50K redeem at $100K ELB paid $150;
+          two $25K redeems at the same ELB paid $100 total — a 33% discount for no economic change). This page
+          and the on-chain proposal (<code>/code-diff</code>) now both charge the closed-form integral of the
+          same marginal rate instead — <code>fee = fee_min·amount + (fee_max−fee_min)·amount²/(2·elb_tranche)</code>,
+          exactly half the old formula&rsquo;s quadratic term — which is the split-invariant fix described on{' '}
+          <code>/open-questions</code>.
         </Callout>
       </div>
 
